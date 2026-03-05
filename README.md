@@ -45,19 +45,59 @@ listen_port = 8080
 
 ## Environment Variables
 
-| Variable         | Description                                      | Required |
-|------------------|--------------------------------------------------|----------|
-| `ADMIN_PASSWORD` | Password for the `/admin/` web UI (Basic Auth)   | Yes      |
+| Variable         | Default | Description                                                                 |
+|------------------|---------|-----------------------------------------------------------------------------|
+| `ADMIN_PASSWORD` | *(none)*| Password for the `/admin/` web UI (Basic Auth). Strongly recommended.       |
+| `PROXY_PORT`     | `8080`  | Port the Ollama proxy listens on. Overrides `server.listen_port` in config. |
+| `ADMIN_PORT`     | `8081`  | Port the admin UI listens on. Overrides `server.admin_port` in config.      |
+| `RUST_LOG`       | `info`  | Log level filter. Use `debug` for request/Langfuse flush details.           |
 
 ## Docker
 
 ```bash
 docker run -d \
   -p 8080:8080 \
+  -p 8081:8081 \
   -e ADMIN_PASSWORD=secret \
+  -e PROXY_PORT=8080 \
+  -e ADMIN_PORT=8081 \
   -v /path/to/config.toml:/etc/ollama_gateway/config.toml \
   avirtuos/ollama_gateway:latest
 ```
+
+## Portainer Stack
+
+Paste the following into **Portainer → Stacks → Add stack → Web editor**. Adjust the volume path and environment variables to suit your environment.
+
+```yaml
+version: "3.8"
+
+services:
+  ollama_gateway:
+    image: avirtuos/ollama_gateway:latest
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+      - "${ADMIN_PORT:-8081}:8081"
+    environment:
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      - PROXY_PORT=${PROXY_PORT:-8080}
+      - ADMIN_PORT=${ADMIN_PORT:-8081}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      - /opt/ollama_gateway/config.toml:/etc/ollama_gateway/config.toml
+```
+
+**Stack environment variables** (set these in Portainer's "Environment variables" panel below the editor):
+
+| Variable         | Example          | Description                                    |
+|------------------|------------------|------------------------------------------------|
+| `ADMIN_PASSWORD` | `changeme`       | Admin UI password — required                   |
+| `PROXY_PORT`     | `8080`           | Host port for the Ollama proxy                 |
+| `ADMIN_PORT`     | `8081`           | Host port for the admin UI                     |
+| `RUST_LOG`       | `info`           | Log verbosity (`error`, `warn`, `info`, `debug`)|
+
+> **Note:** The config file at `/opt/ollama_gateway/config.toml` on the host must exist before starting the stack. Copy [`config.example.toml`](config.example.toml) as a starting point.
 
 ## Admin UI
 
