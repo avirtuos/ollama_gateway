@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
             shutdown_rx.wait_for(|v| *v).await.ok();
         });
 
-    let admin_server = axum::serve(admin_listener, admin_app)
+    let admin_server = axum::serve(admin_listener, tower::Layer::layer(&ConnectionIdLayer, admin_app))
         .with_graceful_shutdown(async move {
             shutdown_rx2.wait_for(|v| *v).await.ok();
         });

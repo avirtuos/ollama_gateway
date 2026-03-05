@@ -210,7 +210,7 @@ async fn handle_streaming_response(
                 session_id,
                 ttft_ms,
             ) {
-                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, ttft_ms = ?event.ttft_ms, "queuing trace event");
+                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, ttft_ms = ?event.ttft_ms, "queuing trace event");
                 collector.send(event);
             }
         }
