@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{StatusCode, Uri},
     response::Response,
 };
@@ -10,7 +10,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::BodyExt;
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
@@ -28,17 +28,32 @@ pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    let path = req.uri().path().to_string();
-    debug!(method = %req.method(), path = %path, "proxying request");
+    let method = req.method().clone();
+    let url = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/").to_string();
+    let remote = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    info!(method = %method, url = %url, remote = %remote, "→");
+
     let collector = state.langfuse_collector.read().await.clone();
     let should_trace = collector.is_some()
-        && TRACED_PATHS.iter().any(|p| path == *p || path.starts_with(p));
+        && TRACED_PATHS.iter().any(|p| url == *p || url.starts_with(p));
 
-    if should_trace {
+    let result = if should_trace {
         proxy_with_tracing(state, collector, req).await
     } else {
         proxy_passthrough(state, req).await
+    };
+
+    match &result {
+        Ok(resp) => info!(method = %method, url = %url, remote = %remote, status = %resp.status(), "←"),
+        Err(status) => info!(method = %method, url = %url, remote = %remote, status = %status, "←"),
     }
+
+    result
 }
 
 /// Zero-copy passthrough for non-traced endpoints.

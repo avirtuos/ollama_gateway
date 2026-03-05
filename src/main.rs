@@ -122,12 +122,24 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let proxy_server = axum::serve(proxy_listener, tower::Layer::layer(&ConnectionIdLayer, proxy_app))
-        .with_graceful_shutdown(async move {
-            shutdown_rx.wait_for(|v| *v).await.ok();
-        });
+    let proxy_server = axum::serve(
+        proxy_listener,
+        tower::Layer::layer(
+            &ConnectionIdLayer,
+            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_rx.wait_for(|v| *v).await.ok();
+    });
 
-    let admin_server = axum::serve(admin_listener, tower::Layer::layer(&ConnectionIdLayer, admin_app))
+    let admin_server = axum::serve(
+        admin_listener,
+        tower::Layer::layer(
+            &ConnectionIdLayer,
+            admin_app.into_make_service_with_connect_info::<SocketAddr>(),
+        ),
+    )
         .with_graceful_shutdown(async move {
             shutdown_rx2.wait_for(|v| *v).await.ok();
         });
