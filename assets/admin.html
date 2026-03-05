@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ollama Gateway Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f4f6f8; color: #222; }
+  header { background: #1a1a2e; color: #fff; padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .8rem; }
+  header h1 { font-size: 1.4rem; font-weight: 600; }
+  .tab-bar { display: flex; gap: .3rem; }
+  .tab { background: transparent; border: 1px solid rgba(255,255,255,.3); color: rgba(255,255,255,.75); padding: .35rem .85rem; border-radius: 5px; font-size: .88rem; font-weight: 500; cursor: pointer; transition: background .15s, color .15s; }
+  .tab:hover { background: rgba(255,255,255,.1); color: #fff; }
+  .tab.active { background: #fff; color: #1a1a2e; border-color: #fff; }
+  main { max-width: 860px; margin: 2rem auto; padding: 0 1rem; display: flex; flex-direction: column; gap: 2rem; }
+  section { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); padding: 1.5rem; }
+  section h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1.2rem; border-bottom: 1px solid #e5e7eb; padding-bottom: .6rem; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem 1.2rem; }
+  .form-group { display: flex; flex-direction: column; gap: .3rem; }
+  .form-group.full { grid-column: 1 / -1; }
+  label { font-size: .82rem; font-weight: 500; color: #555; }
+  input[type="text"], input[type="number"], input[type="password"], select, textarea {
+    border: 1px solid #d1d5db; border-radius: 5px; padding: .45rem .65rem;
+    font-size: .9rem; width: 100%; outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: #4f46e5; box-shadow: 0 0 0 2px rgba(79,70,229,.15); }
+  .checkbox-row { display: flex; align-items: center; gap: .5rem; }
+  .checkbox-row input[type="checkbox"] { width: 1rem; height: 1rem; cursor: pointer; }
+  .btn { display: inline-flex; align-items: center; gap: .4rem; padding: .45rem .9rem;
+    border: none; border-radius: 5px; font-size: .88rem; font-weight: 500;
+    cursor: pointer; transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn-primary { background: #4f46e5; color: #fff; }
+  .btn-danger  { background: #dc2626; color: #fff; }
+  .btn-success { background: #16a34a; color: #fff; }
+  .btn-row { margin-top: 1rem; display: flex; gap: .6rem; align-items: center; }
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th { text-align: left; padding: .5rem .75rem; background: #f9fafb; font-size: .8rem;
+       font-weight: 600; color: #6b7280; border-bottom: 1px solid #e5e7eb; }
+  td { padding: .55rem .75rem; border-bottom: 1px solid #f3f4f6; font-family: monospace; }
+  tr:last-child td { border-bottom: none; }
+  .add-form { display: flex; gap: .7rem; margin-top: 1rem; flex-wrap: wrap; }
+  .add-form input { flex: 1; min-width: 160px; }
+  #status-bar { position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%);
+    background: #1a1a2e; color: #fff; padding: .55rem 1.2rem; border-radius: 20px;
+    font-size: .85rem; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 999; }
+  #status-bar.show { opacity: 1; }
+  .empty-msg { text-align: center; color: #9ca3af; padding: 1.5rem; font-size: .88rem; }
+  /* Chat */
+  .chat-toolbar { display: flex; gap: .7rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
+  .chat-toolbar label { white-space: nowrap; }
+  .chat-toolbar select { flex: 1; min-width: 200px; }
+  #chat-messages { height: 420px; overflow-y: auto; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 1rem; background: #f9fafb; display: flex; flex-direction: column; gap: .7rem; margin-bottom: .8rem; }
+  .msg { padding: .6rem .9rem; border-radius: 8px; max-width: 85%; word-wrap: break-word; white-space: pre-wrap; line-height: 1.5; font-size: .9rem; }
+  .msg-user { background: #4f46e5; color: #fff; align-self: flex-end; }
+  .msg-assistant { background: #fff; border: 1px solid #e5e7eb; align-self: flex-start; }
+  .chat-input-row { display: flex; gap: .7rem; }
+  .chat-input-row textarea { flex: 1; resize: vertical; min-height: 72px; font-family: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Ollama Gateway — Admin</h1>
+  <nav class="tab-bar">
+    <button class="tab active" data-tab="settings" onclick="showTab('settings')">Settings</button>
+    <button class="tab" data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
+    <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
+  </nav>
+</header>
+
+<main>
+  <!-- Settings Tab -->
+  <div id="tab-settings">
+    <section>
+      <h2>Ollama Settings</h2>
+      <div class="form-grid">
+        <div class="form-group full">
+          <label for="ollama-url">Upstream URL</label>
+          <input type="text" id="ollama-url" placeholder="http://localhost:11434">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveOllamaConfig()">Save</button>
+      </div>
+    </section>
+    <section>
+      <h2>Langfuse Settings</h2>
+      <div class="form-grid">
+        <div class="form-group full">
+          <div class="checkbox-row">
+            <input type="checkbox" id="lf-enabled">
+            <label for="lf-enabled">Enable Langfuse tracing</label>
+          </div>
+        </div>
+        <div class="form-group full">
+          <label for="lf-host">Langfuse Host URL</label>
+          <input type="text" id="lf-host" placeholder="https://cloud.langfuse.com">
+        </div>
+        <div class="form-group">
+          <label for="lf-pubkey">Public Key</label>
+          <input type="text" id="lf-pubkey" placeholder="pk-lf-...">
+        </div>
+        <div class="form-group">
+          <label for="lf-seckey">Secret Key</label>
+          <input type="password" id="lf-seckey" placeholder="sk-lf-...">
+        </div>
+        <div class="form-group">
+          <label for="lf-batch">Batch Size</label>
+          <input type="number" id="lf-batch" min="1" max="500">
+        </div>
+        <div class="form-group">
+          <label for="lf-flush">Flush Interval (ms)</label>
+          <input type="number" id="lf-flush" min="100">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveLangfuse()">Save Settings</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- Tokens Tab -->
+  <div id="tab-tokens" style="display:none">
+    <section>
+      <h2>Access Tokens</h2>
+      <table id="tokens-table">
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>App Name</th>
+            <th style="width:80px"></th>
+          </tr>
+        </thead>
+        <tbody id="tokens-body"></tbody>
+      </table>
+      <div class="add-form">
+        <input type="text" id="new-token" placeholder="Token (e.g. sk-myapp-abc123)">
+        <input type="text" id="new-app-name" placeholder="App name">
+        <button class="btn btn-success" onclick="addToken()">Add Token</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- Chat Tab -->
+  <div id="tab-chat" style="display:none">
+    <section>
+      <h2>Chat</h2>
+      <div class="chat-toolbar">
+        <label for="chat-model">Model:</label>
+        <select id="chat-model"><option value="">Loading models…</option></select>
+        <button class="btn btn-danger" onclick="clearChat()">Clear</button>
+      </div>
+      <div id="chat-messages"></div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
+        <button id="chat-send" class="btn btn-primary" onclick="sendMessage()" style="align-self:flex-end;">Send</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div id="status-bar"></div>
+
+<script>
+  let password = null;
+
+  function authHeader() {
+    return 'Basic ' + btoa('admin:' + (password || ''));
+  }
+
+  function showStatus(msg, ok = true) {
+    const bar = document.getElementById('status-bar');
+    bar.textContent = msg;
+    bar.style.background = ok ? '#15803d' : '#b91c1c';
+    bar.classList.add('show');
+    setTimeout(() => bar.classList.remove('show'), 2500);
+  }
+
+  async function apiFetch(url, opts = {}) {
+    if (!password && password !== '') {
+      password = prompt('Enter admin password:') ?? '';
+    }
+    opts.headers = Object.assign({ 'Authorization': authHeader(), 'Content-Type': 'application/json' }, opts.headers || {});
+    let resp = await fetch(url, opts);
+    if (resp.status === 401) {
+      password = prompt('Incorrect password. Enter admin password:') ?? '';
+      opts.headers['Authorization'] = authHeader();
+      resp = await fetch(url, opts);
+    }
+    return resp;
+  }
+
+  function showTab(name) {
+    ['settings', 'tokens', 'chat'].forEach(t => {
+      document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
+      document.querySelector(`.tab[data-tab="${t}"]`).classList.toggle('active', t === name);
+    });
+    if (name === 'chat') loadModels();
+  }
+
+  // --- Ollama ---
+
+  async function loadOllamaConfig() {
+    const resp = await apiFetch('/api/config');
+    if (!resp.ok) { showStatus('Failed to load Ollama config', false); return; }
+    const d = await resp.json();
+    document.getElementById('ollama-url').value = d.ollama_url || '';
+  }
+
+  async function saveOllamaConfig() {
+    const ollama_url = document.getElementById('ollama-url').value.trim();
+    if (!ollama_url) { showStatus('Ollama URL is required', false); return; }
+    const resp = await apiFetch('/api/config', { method: 'PUT', body: JSON.stringify({ ollama_url }) });
+    if (resp.ok) { showStatus('Ollama settings saved'); }
+    else         { showStatus('Failed to save Ollama settings', false); }
+  }
+
+  // --- Langfuse ---
+
+  async function loadLangfuse() {
+    const resp = await apiFetch('/api/langfuse');
+    if (!resp.ok) { showStatus('Failed to load Langfuse config', false); return; }
+    const d = await resp.json();
+    document.getElementById('lf-enabled').checked  = !!d.enabled;
+    document.getElementById('lf-host').value        = d.host || '';
+    document.getElementById('lf-pubkey').value      = d.public_key || '';
+    document.getElementById('lf-seckey').value      = d.secret_key || '';
+    document.getElementById('lf-batch').value       = d.batch_size ?? 10;
+    document.getElementById('lf-flush').value       = d.flush_interval_ms ?? 5000;
+  }
+
+  async function saveLangfuse() {
+    const body = {
+      enabled:           document.getElementById('lf-enabled').checked,
+      host:              document.getElementById('lf-host').value.trim(),
+      public_key:        document.getElementById('lf-pubkey').value.trim(),
+      secret_key:        document.getElementById('lf-seckey').value.trim(),
+      batch_size:        parseInt(document.getElementById('lf-batch').value) || 10,
+      flush_interval_ms: parseInt(document.getElementById('lf-flush').value) || 5000,
+    };
+    const resp = await apiFetch('/api/langfuse', { method: 'PUT', body: JSON.stringify(body) });
+    if (resp.ok) { showStatus('Langfuse settings saved'); }
+    else         { showStatus('Failed to save Langfuse settings', false); }
+  }
+
+  // --- Tokens ---
+
+  async function loadTokens() {
+    const resp = await apiFetch('/api/tokens');
+    if (!resp.ok) { showStatus('Failed to load tokens', false); return; }
+    const tokens = await resp.json();
+    const tbody = document.getElementById('tokens-body');
+    if (!tokens || tokens.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty-msg">No tokens configured</td></tr>';
+      return;
+    }
+    tbody.innerHTML = tokens.map(t => `
+      <tr>
+        <td>${esc(t.token)}</td>
+        <td>${esc(t.app_name)}</td>
+        <td><button class="btn btn-danger" onclick="removeToken('${esc(t.token)}')">Delete</button></td>
+      </tr>
+    `).join('');
+  }
+
+  async function addToken() {
+    const token   = document.getElementById('new-token').value.trim();
+    const appName = document.getElementById('new-app-name').value.trim();
+    if (!token || !appName) { showStatus('Token and app name are required', false); return; }
+    const resp = await apiFetch('/api/tokens', {
+      method: 'POST',
+      body: JSON.stringify({ token, app_name: appName }),
+    });
+    if (resp.ok) {
+      document.getElementById('new-token').value = '';
+      document.getElementById('new-app-name').value = '';
+      showStatus('Token added');
+      loadTokens();
+    } else {
+      showStatus('Failed to add token', false);
+    }
+  }
+
+  async function removeToken(token) {
+    if (!confirm('Delete token: ' + token + '?')) return;
+    const resp = await apiFetch('/api/tokens/' + encodeURIComponent(token), { method: 'DELETE' });
+    if (resp.ok) { showStatus('Token deleted'); loadTokens(); }
+    else         { showStatus('Failed to delete token', false); }
+  }
+
+  // --- Chat ---
+
+  let messages = [];
+  let chatStreaming = false;
+
+  async function loadModels() {
+    const select = document.getElementById('chat-model');
+    select.innerHTML = '<option value="">Loading…</option>';
+    try {
+      const [modelsResp, runningResp] = await Promise.all([
+        apiFetch('/api/models'),
+        apiFetch('/api/models/running'),
+      ]);
+      const modelsData  = modelsResp.ok  ? await modelsResp.json()  : { models: [] };
+      const runningData = runningResp.ok ? await runningResp.json() : { models: [] };
+      const allModels   = (modelsData.models  || []).map(m => m.name);
+      const runningName = (runningData.models || [])[0]?.name;
+      if (allModels.length === 0) {
+        select.innerHTML = '<option value="">No models found</option>';
+      } else {
+        select.innerHTML = allModels.map(name =>
+          `<option value="${esc(name)}"${name === runningName ? ' selected' : ''}>${esc(name)}</option>`
+        ).join('');
+      }
+    } catch (e) {
+      select.innerHTML = '<option value="">Failed to load models</option>';
+    }
+  }
+
+  function clearChat() {
+    messages = [];
+    document.getElementById('chat-messages').innerHTML = '';
+  }
+
+  function appendMessage(role, content) {
+    const area = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+    div.className = 'msg msg-' + role;
+    div.textContent = content;
+    area.appendChild(div);
+    area.scrollTop = area.scrollHeight;
+    return div;
+  }
+
+  async function sendMessage() {
+    if (chatStreaming) return;
+    const input  = document.getElementById('chat-input');
+    const model  = document.getElementById('chat-model').value;
+    const content = input.value.trim();
+    if (!content) return;
+    if (!model) { showStatus('Please select a model', false); return; }
+
+    input.value = '';
+    messages.push({ role: 'user', content });
+    appendMessage('user', content);
+
+    const assistantDiv = appendMessage('assistant', '');
+    let assistantContent = '';
+    chatStreaming = true;
+    document.getElementById('chat-send').disabled = true;
+
+    try {
+      const resp = await apiFetch('/api/chat', {
+        method: 'POST',
+        body: JSON.stringify({ model, messages, stream: true }),
+      });
+
+      if (!resp.ok) {
+        assistantDiv.textContent = '[Error: ' + resp.status + ']';
+      } else {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const chunk = JSON.parse(line);
+              if (chunk.message?.content) {
+                assistantContent += chunk.message.content;
+                assistantDiv.textContent = assistantContent;
+                const area = document.getElementById('chat-messages');
+                area.scrollTop = area.scrollHeight;
+              }
+            } catch {}
+          }
+        }
+
+        messages.push({ role: 'assistant', content: assistantContent });
+      }
+    } catch (e) {
+      assistantDiv.textContent = '[Error: ' + e.message + ']';
+    }
+
+    chatStreaming = false;
+    document.getElementById('chat-send').disabled = false;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  // Initial load
+  (async () => {
+    password = prompt('Enter admin password:') ?? '';
+    await Promise.all([loadOllamaConfig(), loadLangfuse(), loadTokens()]);
+  })();
+</script>
+</body>
+</html>

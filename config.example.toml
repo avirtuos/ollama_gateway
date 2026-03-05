@@ -1,0 +1,23 @@
+[ollama]
+upstream_url = "http://localhost:11434"
+
+[langfuse]
+enabled = true
+host = "https://cloud.langfuse.com"
+public_key = "pk-lf-..."
+secret_key = "sk-lf-..."
+batch_size = 10
+flush_interval_ms = 5000
+
+[[tokens]]
+token = "sk-myapp-abc123"
+app_name = "my-frontend-app"
+
+[[tokens]]
+token = "sk-backend-def456"
+app_name = "backend-service"
+
+[server]
+listen_addr = "0.0.0.0"
+listen_port = 8080
+admin_port  = 8081
