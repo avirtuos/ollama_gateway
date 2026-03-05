@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::AppName,
+    connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
     ollama::is_streaming,
     state::AppState,
@@ -71,6 +72,11 @@ async fn proxy_with_tracing(
         .map(|a| a.0.clone())
         .unwrap_or_default();
 
+    let session_id = req
+        .extensions()
+        .get::<ConnectionId>()
+        .map(|c| c.0.clone());
+
     let path = req.uri().path().to_string();
     let start_time = Utc::now();
 
@@ -99,9 +105,9 @@ async fn proxy_with_tracing(
     })?;
 
     if streaming {
-        handle_streaming_response(collector, resp, req_json, app_name, path, start_time).await
+        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id).await
     } else {
-        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time).await
+        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id).await
     }
 }
 
@@ -112,6 +118,7 @@ async fn handle_non_streaming_response(
     app_name: String,
     path: String,
     start_time: chrono::DateTime<chrono::Utc>,
+    session_id: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
     let resp_bytes = resp_body
@@ -131,8 +138,9 @@ async fn handle_non_streaming_response(
             &app_name,
             start_time,
             end_time,
+            session_id,
         ) {
-            debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, "queuing trace event");
+            debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
             collector.send(event);
         }
     }
@@ -149,6 +157,7 @@ async fn handle_streaming_response(
     app_name: String,
     path: String,
     start_time: chrono::DateTime<chrono::Utc>,
+    session_id: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
 
@@ -192,8 +201,9 @@ async fn handle_streaming_response(
                 &app_name,
                 start_time,
                 end_time,
+                session_id,
             ) {
-                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, "queuing trace event");
+                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
                 collector.send(event);
             }
         }
@@ -211,6 +221,7 @@ fn build_trace_event(
     app_name: &str,
     start_time: chrono::DateTime<chrono::Utc>,
     end_time: chrono::DateTime<chrono::Utc>,
+    session_id: Option<String>,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
     let resp_json: serde_json::Value = serde_json::from_slice(resp_bytes).ok()?;
@@ -222,7 +233,7 @@ fn build_trace_event(
         .to_string();
 
     let input = extract_input(req_body, path);
-    let (output, prompt_tokens, completion_tokens) = extract_output(&resp_json, path);
+    let (output, prompt_tokens, completion_tokens, tokens_per_sec) = extract_output(&resp_json, path);
 
     Some(LangfuseEvent {
         trace_id: Uuid::new_v4().to_string(),
@@ -236,6 +247,8 @@ fn build_trace_event(
         end_time,
         prompt_tokens,
         completion_tokens,
+        tokens_per_sec,
+        session_id,
     })
 }
 
@@ -246,6 +259,7 @@ fn build_trace_event_from_stream(
     app_name: &str,
     start_time: chrono::DateTime<chrono::Utc>,
     end_time: chrono::DateTime<chrono::Utc>,
+    session_id: Option<String>,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
 
@@ -271,12 +285,16 @@ fn build_trace_event_from_stream(
     // Find the done chunk
     let done_chunk = chunks.iter().find(|c| c.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
 
-    let (mut output_text, prompt_tokens, completion_tokens) = if let Some(done) = done_chunk {
+    let (mut output_text, prompt_tokens, completion_tokens, tokens_per_sec) = if let Some(done) = done_chunk {
         let prompt_tokens = done.get("prompt_eval_count").and_then(|v| v.as_u64());
         let completion_tokens = done.get("eval_count").and_then(|v| v.as_u64());
-        (String::new(), prompt_tokens, completion_tokens)
+        let eval_duration_ns = done.get("eval_duration").and_then(|v| v.as_u64());
+        let tokens_per_sec = completion_tokens.zip(eval_duration_ns).and_then(|(tokens, ns)| {
+            if ns == 0 { None } else { Some(tokens as f64 / (ns as f64 / 1_000_000_000.0)) }
+        });
+        (String::new(), prompt_tokens, completion_tokens, tokens_per_sec)
     } else {
-        (String::new(), None, None)
+        (String::new(), None, None, None)
     };
 
     // Concatenate all content from message chunks
@@ -306,6 +324,8 @@ fn build_trace_event_from_stream(
         end_time,
         prompt_tokens,
         completion_tokens,
+        tokens_per_sec,
+        session_id,
     })
 }
 
@@ -329,9 +349,13 @@ fn extract_input(req_body: &serde_json::Value, path: &str) -> serde_json::Value 
 fn extract_output(
     resp_json: &serde_json::Value,
     path: &str,
-) -> (serde_json::Value, Option<u64>, Option<u64>) {
+) -> (serde_json::Value, Option<u64>, Option<u64>, Option<f64>) {
     let prompt_tokens = resp_json.get("prompt_eval_count").and_then(|v| v.as_u64());
     let completion_tokens = resp_json.get("eval_count").and_then(|v| v.as_u64());
+    let eval_duration_ns = resp_json.get("eval_duration").and_then(|v| v.as_u64());
+    let tokens_per_sec = completion_tokens.zip(eval_duration_ns).and_then(|(tokens, ns)| {
+        if ns == 0 { None } else { Some(tokens as f64 / (ns as f64 / 1_000_000_000.0)) }
+    });
 
     let output = match path {
         "/api/chat" => resp_json
@@ -349,7 +373,7 @@ fn extract_output(
         _ => serde_json::Value::Null,
     };
 
-    (output, prompt_tokens, completion_tokens)
+    (output, prompt_tokens, completion_tokens, tokens_per_sec)
 }
 
 fn build_upstream_request(

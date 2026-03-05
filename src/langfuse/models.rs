@@ -21,6 +21,8 @@ pub struct LangfuseEvent {
     pub end_time: DateTime<Utc>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    pub tokens_per_sec: Option<f64>,
+    pub session_id: Option<String>,
 }
 
 impl LangfuseEvent {
@@ -34,6 +36,7 @@ impl LangfuseEvent {
                 id: Some(Some(self.trace_id.clone())),
                 name: Some(Some(format!("{} - {}", self.app_name, self.endpoint))),
                 user_id: Some(Some(self.app_name.clone())),
+                session_id: self.session_id.clone().map(Some),
                 tags: Some(Some(vec![self.app_name.clone(), self.endpoint.clone()])),
                 timestamp: Some(Some(timestamp.clone())),
                 ..Default::default()
@@ -48,6 +51,10 @@ impl LangfuseEvent {
             ..Default::default()
         }));
 
+        let metadata = self.tokens_per_sec.map(|tps| {
+            Some(serde_json::json!({ "tokens_per_sec": tps }))
+        });
+
         let generation = IngestionEvent::IngestionEventOneOf4(Box::new(IngestionEventOneOf4::new(
             Uuid::new_v4().to_string(),
             timestamp.clone(),
@@ -61,6 +68,7 @@ impl LangfuseEvent {
                 input: Some(Some(self.input)),
                 output: Some(Some(self.output)),
                 usage: Some(Box::new(usage)),
+                metadata,
                 ..Default::default()
             },
             GenerationType::GenerationCreate,
@@ -89,6 +97,8 @@ mod tests {
             end_time: Utc::now(),
             prompt_tokens: Some(10),
             completion_tokens: Some(5),
+            tokens_per_sec: Some(42.5),
+            session_id: Some("session-abc".to_string()),
         };
         let events = event.clone().into_ingestion_events();
         assert_eq!(events.len(), 2);

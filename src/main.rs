@@ -1,6 +1,7 @@
 mod admin;
 mod auth;
 mod config;
+mod connection_id;
 mod error;
 mod langfuse;
 mod ollama;
@@ -18,6 +19,7 @@ use tracing::info;
 use admin::admin_router;
 use auth::auth_middleware;
 use config::Config;
+use connection_id::ConnectionIdLayer;
 use langfuse::LangfuseCollector;
 use proxy::proxy_handler;
 use state::AppState;
@@ -120,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let proxy_server = axum::serve(proxy_listener, proxy_app)
+    let proxy_server = axum::serve(proxy_listener, tower::Layer::layer(&ConnectionIdLayer, proxy_app))
         .with_graceful_shutdown(async move {
             shutdown_rx.wait_for(|v| *v).await.ok();
         });
