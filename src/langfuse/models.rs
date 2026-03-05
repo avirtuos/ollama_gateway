@@ -22,6 +22,7 @@ pub struct LangfuseEvent {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub tokens_per_sec: Option<f64>,
+    pub ttft_ms: Option<f64>,
     pub session_id: Option<String>,
 }
 
@@ -51,9 +52,15 @@ impl LangfuseEvent {
             ..Default::default()
         }));
 
-        let metadata = self.tokens_per_sec.map(|tps| {
-            Some(serde_json::json!({ "tokens_per_sec": tps }))
-        });
+        let metadata = match (self.tokens_per_sec, self.ttft_ms) {
+            (None, None) => None,
+            (tps, ttft) => {
+                let mut map = serde_json::Map::new();
+                if let Some(v) = tps  { map.insert("tokens_per_sec".to_string(), serde_json::json!(v)); }
+                if let Some(v) = ttft { map.insert("time_to_first_token_ms".to_string(), serde_json::json!(v)); }
+                Some(Some(serde_json::Value::Object(map)))
+            }
+        };
 
         let generation = IngestionEvent::IngestionEventOneOf4(Box::new(IngestionEventOneOf4::new(
             Uuid::new_v4().to_string(),
@@ -98,6 +105,7 @@ mod tests {
             prompt_tokens: Some(10),
             completion_tokens: Some(5),
             tokens_per_sec: Some(42.5),
+            ttft_ms: Some(180.0),
             session_id: Some("session-abc".to_string()),
         };
         let events = event.clone().into_ingestion_events();

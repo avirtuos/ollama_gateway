@@ -167,11 +167,15 @@ async fn handle_streaming_response(
     tokio::spawn(async move {
         let mut accumulated = Vec::<u8>::new();
         let mut stream = resp_body;
+        let mut first_chunk_time: Option<chrono::DateTime<chrono::Utc>> = None;
 
         loop {
             match http_body_util::BodyExt::frame(&mut stream).await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
+                        if first_chunk_time.is_none() {
+                            first_chunk_time = Some(Utc::now());
+                        }
                         accumulated.extend_from_slice(&data);
                         if tx.send(Ok(data)).await.is_err() {
                             // Client disconnected
@@ -192,6 +196,8 @@ async fn handle_streaming_response(
 
         // Stream done — emit trace
         let end_time = Utc::now();
+        let ttft_ms = first_chunk_time
+            .map(|t| (t - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0);
         if let Some(collector) = collector {
             let accumulated_bytes = Bytes::from(accumulated);
             if let Some(event) = build_trace_event_from_stream(
@@ -202,8 +208,9 @@ async fn handle_streaming_response(
                 start_time,
                 end_time,
                 session_id,
+                ttft_ms,
             ) {
-                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
+                debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, ttft_ms = ?event.ttft_ms, "queuing trace event");
                 collector.send(event);
             }
         }
@@ -248,6 +255,7 @@ fn build_trace_event(
         prompt_tokens,
         completion_tokens,
         tokens_per_sec,
+        ttft_ms: None,
         session_id,
     })
 }
@@ -260,6 +268,7 @@ fn build_trace_event_from_stream(
     start_time: chrono::DateTime<chrono::Utc>,
     end_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
+    ttft_ms: Option<f64>,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
 
@@ -325,6 +334,7 @@ fn build_trace_event_from_stream(
         prompt_tokens,
         completion_tokens,
         tokens_per_sec,
+        ttft_ms,
         session_id,
     })
 }
@@ -396,7 +406,9 @@ fn build_upstream_request(
         .uri(uri);
 
     // Forward headers, skipping hop-by-hop headers
-    let skip = ["host", "connection", "transfer-encoding", "authorization"];
+    // Strip hop-by-hop headers and browser-side headers that confuse Ollama's
+    // CORS check (Origin/Referer cause 403 when the client is on a remote host).
+    let skip = ["host", "connection", "transfer-encoding", "authorization", "origin", "referer"];
     for (name, value) in &parts.headers {
         if !skip.contains(&name.as_str()) {
             builder = builder.header(name, value);
