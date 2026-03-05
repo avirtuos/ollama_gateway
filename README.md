@@ -1,5 +1,9 @@
 # Ollama Gateway
 
+<p align="center">
+  <img src="docs/images/admin_ui.png" alt="Ollama Gateway Admin UI" width="800"/>
+</p>
+
 An authenticated reverse proxy for [Ollama](https://ollama.com) with [Langfuse](https://langfuse.com) tracing and a web-based admin UI.
 
 ## Features
