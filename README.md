@@ -67,7 +67,7 @@ docker run -d \
 
 ## Portainer Stack
 
-Paste the following into **Portainer → Stacks → Add stack → Web editor**. Adjust the volume path and environment variables to suit your environment.
+Paste the following into **Portainer → Stacks → Add stack → Web editor**. Set the environment variables in Portainer's "Environment variables" panel below the editor.
 
 ```yaml
 version: "3.8"
@@ -85,19 +85,22 @@ services:
       - ADMIN_PORT=${ADMIN_PORT:-8081}
       - RUST_LOG=${RUST_LOG:-info}
     volumes:
-      - /opt/ollama_gateway/config.toml:/etc/ollama_gateway/config.toml
+      - ollama_gateway_config:/etc/ollama_gateway
+
+volumes:
+  ollama_gateway_config:
 ```
 
 **Stack environment variables** (set these in Portainer's "Environment variables" panel below the editor):
 
-| Variable         | Example          | Description                                    |
-|------------------|------------------|------------------------------------------------|
-| `ADMIN_PASSWORD` | `changeme`       | Admin UI password — required                   |
-| `PROXY_PORT`     | `8080`           | Host port for the Ollama proxy                 |
-| `ADMIN_PORT`     | `8081`           | Host port for the admin UI                     |
-| `RUST_LOG`       | `info`           | Log verbosity (`error`, `warn`, `info`, `debug`)|
+| Variable         | Example          | Description                                     |
+|------------------|------------------|-------------------------------------------------|
+| `ADMIN_PASSWORD` | `changeme`       | Admin UI password — required                    |
+| `PROXY_PORT`     | `8080`           | Host port for the Ollama proxy                  |
+| `ADMIN_PORT`     | `8081`           | Host port for the admin UI                      |
+| `RUST_LOG`       | `info`           | Log verbosity (`error`, `warn`, `info`, `debug`) |
 
-> **Note:** The config file at `/opt/ollama_gateway/config.toml` on the host must exist before starting the stack. Copy [`config.example.toml`](config.example.toml) as a starting point.
+> **Note:** On first start the gateway will create a default `config.toml` inside the volume. Configure Langfuse and tokens via the admin UI at `http://<host>:${ADMIN_PORT}/` — all changes are persisted back to the volume automatically.
 
 ## Admin UI
 
