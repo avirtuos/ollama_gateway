@@ -70,7 +70,7 @@ async fn flush_loop(batcher: Arc<Batcher>, interval_ms: u64) {
     interval.tick().await; // skip immediate first tick
     loop {
         interval.tick().await;
-        debug!("Langfuse timer flush triggered");
+        tracing::trace!("Langfuse timer flush triggered");
         log_flush_result("timer", batcher.flush().await);
     }
 }
