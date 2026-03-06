@@ -40,6 +40,11 @@ pub async fn proxy_handler(
         .get::<AppName>()
         .map(|a| a.0.clone())
         .unwrap_or_default();
+    let session_id = req
+        .extensions()
+        .get::<ConnectionId>()
+        .map(|c| c.0.clone())
+        .unwrap_or_default();
 
     let privacy_mode = *state.privacy_mode.read().await;
 
@@ -50,8 +55,8 @@ pub async fn proxy_handler(
     };
 
     match &token_field {
-        Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, "→"),
-        None => info!(method = %method, url = %url, remote = %remote, app = %app_name, "→"),
+        Some(token) => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, token = %token, "→"),
+        None => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, "→"),
     }
 
     let collector = state.langfuse_collector.read().await.clone();
@@ -67,12 +72,12 @@ pub async fn proxy_handler(
 
     match &result {
         Ok(resp) => match &token_field {
-            Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, status = %resp.status(), "←"),
-            None => info!(method = %method, url = %url, remote = %remote, app = %app_name, status = %resp.status(), "←"),
+            Some(token) => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, token = %token, status = %resp.status(), "←"),
+            None => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, status = %resp.status(), "←"),
         },
         Err(status) => match &token_field {
-            Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, status = %status, "←"),
-            None => info!(method = %method, url = %url, remote = %remote, app = %app_name, status = %status, "←"),
+            Some(token) => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, token = %token, status = %status, "←"),
+            None => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, status = %status, "←"),
         },
     }
 
@@ -175,7 +180,7 @@ async fn handle_non_streaming_response(
                 let model = req_body.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
                 let input = extract_input(req_body, &path);
                 let (output, _, _, _) = extract_output(&resp_json, &path);
-                info!(model, input = %input, output = %output, "chat");
+                info!(model, session = ?session_id, input = %input, output = %output, "chat");
             }
         }
     }
@@ -257,7 +262,7 @@ async fn handle_streaming_response(
                 let model = req_body.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
                 let input = extract_input(req_body, &path);
                 let output_text = extract_streaming_output_text(&accumulated_bytes, &path);
-                info!(model, input = %input, output = %output_text, "chat");
+                info!(model, session = ?session_id, input = %input, output = %output_text, "chat");
             }
         }
 
