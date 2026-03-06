@@ -196,7 +196,7 @@ async fn handle_non_streaming_response(
             end_time,
             session_id,
         ) {
-            debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
+            debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
             collector.send(event);
         }
     }
