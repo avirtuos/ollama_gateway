@@ -17,6 +17,10 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AppName(pub String);
 
+/// Extension inserted into requests after successful auth, carrying the bearer token.
+#[derive(Clone, Debug)]
+pub struct BearerToken(pub String);
+
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     mut req: Request<Body>,
@@ -38,6 +42,8 @@ pub async fn auth_middleware(
 
     match app_name {
         Some(name) => {
+            let token = auth_header.unwrap()["Bearer ".len()..].to_string();
+            req.extensions_mut().insert(BearerToken(token));
             // Remove auth header before forwarding
             req.headers_mut().remove("Authorization");
             req.extensions_mut().insert(AppName(name));

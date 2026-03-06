@@ -50,6 +50,8 @@ pub struct ServerConfig {
     pub listen_port: u16,
     #[serde(default = "default_admin_port")]
     pub admin_port: u16,
+    #[serde(default)]
+    pub privacy_mode: bool,
 }
 
 fn default_listen_addr() -> String {
@@ -121,6 +123,7 @@ impl Default for Config {
                 listen_addr: default_listen_addr(),
                 listen_port: default_listen_port(),
                 admin_port: default_admin_port(),
+                privacy_mode: false,
             },
         }
     }

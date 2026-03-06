@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         langfuse_config: Arc::new(RwLock::new(config.langfuse.clone())),
         langfuse_collector: Arc::new(RwLock::new(langfuse_collector.clone())),
         upstream_url: Arc::new(RwLock::new(config.ollama.upstream_url.clone())),
+        privacy_mode: Arc::new(RwLock::new(config.server.privacy_mode)),
         http_client,
         server_config: config.server.clone(),
         config_write_lock: Mutex::new(()),

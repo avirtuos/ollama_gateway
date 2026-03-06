@@ -16,6 +16,7 @@ pub struct AppState {
     pub langfuse_config: Arc<RwLock<LangfuseConfig>>,
     pub langfuse_collector: Arc<RwLock<Option<Arc<LangfuseCollector>>>>,
     pub upstream_url: Arc<RwLock<String>>,
+    pub privacy_mode: Arc<RwLock<bool>>,
     pub http_client: Client<HttpConnector, Body>,
     pub server_config: ServerConfig,
     pub config_write_lock: Mutex<()>,

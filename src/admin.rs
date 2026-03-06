@@ -214,12 +214,14 @@ async fn delete_token(
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let ollama_url = state.upstream_url.read().await.clone();
-    Json(json!({ "ollama_url": ollama_url }))
+    let privacy_mode = *state.privacy_mode.read().await;
+    Json(json!({ "ollama_url": ollama_url, "privacy_mode": privacy_mode }))
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdate {
     ollama_url: String,
+    privacy_mode: Option<bool>,
 }
 
 async fn put_config(
@@ -229,6 +231,10 @@ async fn put_config(
     {
         let mut url = state.upstream_url.write().await;
         *url = body.ollama_url;
+    }
+    {
+        let mut pm = state.privacy_mode.write().await;
+        *pm = body.privacy_mode.unwrap_or(false);
     }
 
     if let Err(e) = save_config_to_disk(&state).await {
@@ -304,13 +310,17 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
     };
 
     let upstream_url = state.upstream_url.read().await.clone();
+    let privacy_mode = *state.privacy_mode.read().await;
     let config = Config {
         ollama: OllamaConfig {
             upstream_url: upstream_url,
         },
         langfuse,
         tokens,
-        server: state.server_config.clone(),
+        server: crate::config::ServerConfig {
+            privacy_mode,
+            ..state.server_config.clone()
+        },
     };
 
     let _write_guard = state.config_write_lock.lock().await;

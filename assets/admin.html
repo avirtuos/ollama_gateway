@@ -81,6 +81,12 @@
           <label for="ollama-url">Upstream URL</label>
           <input type="text" id="ollama-url" placeholder="http://localhost:11434">
         </div>
+        <div class="form-group full">
+          <div class="checkbox-row">
+            <input type="checkbox" id="privacy-mode">
+            <label for="privacy-mode">Privacy mode — suppress prompt/response content and bearer tokens from logs</label>
+          </div>
+        </div>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="saveOllamaConfig()">Save</button>
@@ -209,12 +215,14 @@
     if (!resp.ok) { showStatus('Failed to load Ollama config', false); return; }
     const d = await resp.json();
     document.getElementById('ollama-url').value = d.ollama_url || '';
+    document.getElementById('privacy-mode').checked = !!d.privacy_mode;
   }
 
   async function saveOllamaConfig() {
     const ollama_url = document.getElementById('ollama-url').value.trim();
     if (!ollama_url) { showStatus('Ollama URL is required', false); return; }
-    const resp = await apiFetch('/api/config', { method: 'PUT', body: JSON.stringify({ ollama_url }) });
+    const privacy_mode = document.getElementById('privacy-mode').checked;
+    const resp = await apiFetch('/api/config', { method: 'PUT', body: JSON.stringify({ ollama_url, privacy_mode }) });
     if (resp.ok) { showStatus('Ollama settings saved'); }
     else         { showStatus('Failed to save Ollama settings', false); }
   }

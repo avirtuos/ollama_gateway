@@ -14,7 +14,7 @@ use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::{
-    auth::AppName,
+    auth::{AppName, BearerToken},
     connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
     ollama::is_streaming,
@@ -35,22 +35,45 @@ pub async fn proxy_handler(
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let app_name = req
+        .extensions()
+        .get::<AppName>()
+        .map(|a| a.0.clone())
+        .unwrap_or_default();
 
-    info!(method = %method, url = %url, remote = %remote, "→");
+    let privacy_mode = *state.privacy_mode.read().await;
+
+    let token_field: Option<String> = if !privacy_mode {
+        req.extensions().get::<BearerToken>().map(|t| t.0.clone())
+    } else {
+        None
+    };
+
+    match &token_field {
+        Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, "→"),
+        None => info!(method = %method, url = %url, remote = %remote, app = %app_name, "→"),
+    }
 
     let collector = state.langfuse_collector.read().await.clone();
-    let should_trace = collector.is_some()
-        && TRACED_PATHS.iter().any(|p| url == *p || url.starts_with(p));
+    let on_traced_path = TRACED_PATHS.iter().any(|p| url == *p || url.starts_with(p));
+    let should_trace = collector.is_some() && on_traced_path;
+    let log_content = !privacy_mode && on_traced_path;
 
-    let result = if should_trace {
-        proxy_with_tracing(state, collector, req).await
+    let result = if should_trace || log_content {
+        proxy_with_tracing(state, collector, req, log_content).await
     } else {
         proxy_passthrough(state, req).await
     };
 
     match &result {
-        Ok(resp) => info!(method = %method, url = %url, remote = %remote, status = %resp.status(), "←"),
-        Err(status) => info!(method = %method, url = %url, remote = %remote, status = %status, "←"),
+        Ok(resp) => match &token_field {
+            Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, status = %resp.status(), "←"),
+            None => info!(method = %method, url = %url, remote = %remote, app = %app_name, status = %resp.status(), "←"),
+        },
+        Err(status) => match &token_field {
+            Some(token) => info!(method = %method, url = %url, remote = %remote, app = %app_name, token = %token, status = %status, "←"),
+            None => info!(method = %method, url = %url, remote = %remote, app = %app_name, status = %status, "←"),
+        },
     }
 
     result
@@ -75,11 +98,12 @@ async fn proxy_passthrough(
     Ok(convert_response(resp))
 }
 
-/// Proxy with body buffering for Langfuse tracing.
+/// Proxy with body buffering for Langfuse tracing and/or content logging.
 async fn proxy_with_tracing(
     state: Arc<AppState>,
     collector: Option<Arc<LangfuseCollector>>,
     req: Request<Body>,
+    log_content: bool,
 ) -> Result<Response<Body>, StatusCode> {
     let app_name = req
         .extensions()
@@ -120,9 +144,9 @@ async fn proxy_with_tracing(
     })?;
 
     if streaming {
-        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id).await
+        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content).await
     } else {
-        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id).await
+        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content).await
     }
 }
 
@@ -134,6 +158,7 @@ async fn handle_non_streaming_response(
     path: String,
     start_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
+    log_content: bool,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
     let resp_bytes = resp_body
@@ -143,6 +168,17 @@ async fn handle_non_streaming_response(
         .unwrap_or_default();
 
     let end_time = Utc::now();
+
+    if log_content {
+        if let Some(req_body) = &req_json {
+            if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+                let model = req_body.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+                let input = extract_input(req_body, &path);
+                let (output, _, _, _) = extract_output(&resp_json, &path);
+                info!(model, input = %input, output = %output, "chat");
+            }
+        }
+    }
 
     // Parse and emit trace event in background
     if let Some(collector) = &collector {
@@ -173,6 +209,7 @@ async fn handle_streaming_response(
     path: String,
     start_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
+    log_content: bool,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
 
@@ -209,12 +246,22 @@ async fn handle_streaming_response(
             }
         }
 
-        // Stream done — emit trace
+        // Stream done — log and/or emit trace
         let end_time = Utc::now();
         let ttft_ms = first_chunk_time
             .map(|t| (t - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0);
+        let accumulated_bytes = Bytes::from(accumulated);
+
+        if log_content {
+            if let Some(req_body) = &req_json {
+                let model = req_body.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+                let input = extract_input(req_body, &path);
+                let output_text = extract_streaming_output_text(&accumulated_bytes, &path);
+                info!(model, input = %input, output = %output_text, "chat");
+            }
+        }
+
         if let Some(collector) = collector {
-            let accumulated_bytes = Bytes::from(accumulated);
             if let Some(event) = build_trace_event_from_stream(
                 &req_json,
                 &accumulated_bytes,
@@ -352,6 +399,28 @@ fn build_trace_event_from_stream(
         ttft_ms,
         session_id,
     })
+}
+
+fn extract_streaming_output_text(accumulated: &Bytes, path: &str) -> String {
+    let text = match std::str::from_utf8(accumulated) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let mut output = String::new();
+    for line in text.lines() {
+        if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
+            if path == "/api/chat" {
+                if let Some(content) = chunk.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+                    output.push_str(content);
+                }
+            } else if path == "/api/generate" {
+                if let Some(response) = chunk.get("response").and_then(|r| r.as_str()) {
+                    output.push_str(response);
+                }
+            }
+        }
+    }
+    output
 }
 
 fn extract_input(req_body: &serde_json::Value, path: &str) -> serde_json::Value {
