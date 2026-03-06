@@ -41,9 +41,17 @@ impl LangfuseCollector {
     pub fn send(&self, event: LangfuseEvent) {
         let batcher = Arc::clone(&self.batcher);
         tokio::spawn(async move {
-            let events = event.into_ingestion_events();
-            debug!(count = events.len(), "Queuing Langfuse ingestion events");
-            for ingestion_event in events {
+            info!(
+                trace_id = %event.trace_id,
+                app_name = %event.app_name,
+                model = %event.model,
+                endpoint = %event.endpoint,
+                session_id = ?event.session_id,
+                "queuing Langfuse event"
+            );
+            let ingestion_events = event.into_ingestion_events();
+            debug!(count = ingestion_events.len(), "adding to Langfuse batcher");
+            for ingestion_event in ingestion_events {
                 if let Err(e) = batcher.add(ingestion_event).await {
                     warn!(error = %e, "Failed to queue event in Langfuse batcher");
                 }
@@ -73,7 +81,7 @@ fn log_flush_result(context: &str, result: LangfuseResult<IngestionResponse>) {
             // Nothing to flush — skip noisy log
         }
         Ok(resp) if resp.is_success() => {
-            debug!(
+            info!(
                 context,
                 success_count = resp.success_count,
                 "Langfuse flush successful"
