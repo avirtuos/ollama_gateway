@@ -17,12 +17,15 @@ use crate::{
     auth::{AppName, BearerToken},
     connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
-    ollama::is_streaming,
+
     state::AppState,
 };
 
 /// Endpoints that get Langfuse tracing.
-const TRACED_PATHS: &[&str] = &["/api/chat", "/api/generate", "/api/embed", "/api/embeddings"];
+const TRACED_PATHS: &[&str] = &[
+    "/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
+    "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+];
 
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
@@ -133,7 +136,11 @@ async fn proxy_with_tracing(
         .unwrap_or_default();
 
     let req_json: Option<serde_json::Value> = serde_json::from_slice(&req_bytes).ok();
-    let streaming = req_json.as_ref().map(is_streaming).unwrap_or(true);
+    // OpenAI-compatible paths default stream=false; native Ollama paths default stream=true
+    let stream_default = !path.starts_with("/v1/");
+    let streaming = req_json.as_ref().map(|body| {
+        body.get("stream").and_then(|v| v.as_bool()).unwrap_or(stream_default)
+    }).unwrap_or(stream_default);
 
     // Rebuild request with buffered body
     let upstream_url = state.upstream_url.read().await.clone();
@@ -347,44 +354,63 @@ fn build_trace_event_from_stream(
 
     let input = extract_input(req_body, path);
 
-    // Parse accumulated NDJSON lines
     let text = std::str::from_utf8(accumulated).ok()?;
-    let chunks: Vec<serde_json::Value> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect();
+    let chunks = parse_streaming_chunks(text, path);
 
     if chunks.is_empty() {
         return None;
     }
 
-    // Find the done chunk
-    let done_chunk = chunks.iter().find(|c| c.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
-
-    let (mut output_text, prompt_tokens, completion_tokens, tokens_per_sec) = if let Some(done) = done_chunk {
-        let prompt_tokens = done.get("prompt_eval_count").and_then(|v| v.as_u64());
-        let completion_tokens = done.get("eval_count").and_then(|v| v.as_u64());
-        let eval_duration_ns = done.get("eval_duration").and_then(|v| v.as_u64());
+    // Extract token counts and output text depending on API format
+    let (prompt_tokens, completion_tokens, tokens_per_sec) = if path.starts_with("/v1/") {
+        // OpenAI: usage may appear in a trailing chunk when stream_options.include_usage=true
+        let usage = chunks.iter().find_map(|c| c.get("usage"));
+        let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+        let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
+        (prompt_tokens, completion_tokens, None)
+    } else {
+        // Native Ollama: stats are in the done chunk
+        let done = chunks.iter().find(|c| c.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        let prompt_tokens = done.and_then(|d| d.get("prompt_eval_count")).and_then(|v| v.as_u64());
+        let completion_tokens = done.and_then(|d| d.get("eval_count")).and_then(|v| v.as_u64());
+        let eval_duration_ns = done.and_then(|d| d.get("eval_duration")).and_then(|v| v.as_u64());
         let tokens_per_sec = completion_tokens.zip(eval_duration_ns).and_then(|(tokens, ns)| {
             if ns == 0 { None } else { Some(tokens as f64 / (ns as f64 / 1_000_000_000.0)) }
         });
-        (String::new(), prompt_tokens, completion_tokens, tokens_per_sec)
-    } else {
-        (String::new(), None, None, None)
+        (prompt_tokens, completion_tokens, tokens_per_sec)
     };
 
-    // Concatenate all content from message chunks
+    let mut output_text = String::new();
     for chunk in &chunks {
-        if path == "/api/chat" {
-            if let Some(msg) = chunk.get("message") {
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+        match path {
+            "/api/chat" => {
+                if let Some(content) = chunk.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                     output_text.push_str(content);
                 }
             }
-        } else if path == "/api/generate" {
-            if let Some(response) = chunk.get("response").and_then(|r| r.as_str()) {
-                output_text.push_str(response);
+            "/api/generate" => {
+                if let Some(response) = chunk.get("response").and_then(|r| r.as_str()) {
+                    output_text.push_str(response);
+                }
             }
+            "/v1/chat/completions" => {
+                if let Some(content) = chunk.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    output_text.push_str(content);
+                }
+            }
+            "/v1/completions" => {
+                if let Some(text) = chunk.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    output_text.push_str(text);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -406,23 +432,59 @@ fn build_trace_event_from_stream(
     })
 }
 
+/// Parse streaming chunks from either NDJSON (native Ollama) or SSE (OpenAI /v1/ paths).
+fn parse_streaming_chunks(text: &str, path: &str) -> Vec<serde_json::Value> {
+    if path.starts_with("/v1/") {
+        text.lines()
+            .filter_map(|line| {
+                let payload = line.strip_prefix("data: ")?;
+                if payload == "[DONE]" { return None; }
+                serde_json::from_str(payload).ok()
+            })
+            .collect()
+    } else {
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+}
+
 fn extract_streaming_output_text(accumulated: &Bytes, path: &str) -> String {
     let text = match std::str::from_utf8(accumulated) {
         Ok(t) => t,
         Err(_) => return String::new(),
     };
     let mut output = String::new();
-    for line in text.lines() {
-        if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(line) {
-            if path == "/api/chat" {
+    for chunk in parse_streaming_chunks(text, path) {
+        match path {
+            "/api/chat" => {
                 if let Some(content) = chunk.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                     output.push_str(content);
                 }
-            } else if path == "/api/generate" {
+            }
+            "/api/generate" => {
                 if let Some(response) = chunk.get("response").and_then(|r| r.as_str()) {
                     output.push_str(response);
                 }
             }
+            "/v1/chat/completions" => {
+                if let Some(content) = chunk.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    output.push_str(content);
+                }
+            }
+            "/v1/completions" => {
+                if let Some(text) = chunk.get("choices").and_then(|c| c.get(0))
+                    .and_then(|c| c.get("text"))
+                    .and_then(|t| t.as_str())
+                {
+                    output.push_str(text);
+                }
+            }
+            _ => {}
         }
     }
     output
@@ -430,11 +492,11 @@ fn extract_streaming_output_text(accumulated: &Bytes, path: &str) -> String {
 
 fn extract_input(req_body: &serde_json::Value, path: &str) -> serde_json::Value {
     match path {
-        "/api/chat" => req_body
+        "/api/chat" | "/v1/chat/completions" => req_body
             .get("messages")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
-        "/api/generate" => req_body
+        "/api/generate" | "/v1/completions" => req_body
             .get("prompt")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
@@ -449,30 +511,52 @@ fn extract_output(
     resp_json: &serde_json::Value,
     path: &str,
 ) -> (serde_json::Value, Option<u64>, Option<u64>, Option<f64>) {
-    let prompt_tokens = resp_json.get("prompt_eval_count").and_then(|v| v.as_u64());
-    let completion_tokens = resp_json.get("eval_count").and_then(|v| v.as_u64());
-    let eval_duration_ns = resp_json.get("eval_duration").and_then(|v| v.as_u64());
-    let tokens_per_sec = completion_tokens.zip(eval_duration_ns).and_then(|(tokens, ns)| {
-        if ns == 0 { None } else { Some(tokens as f64 / (ns as f64 / 1_000_000_000.0)) }
-    });
-
-    let output = match path {
-        "/api/chat" => resp_json
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "/api/generate" => resp_json
-            .get("response")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "/api/embed" | "/api/embeddings" => {
-            serde_json::Value::String("[embedding vector]".to_string())
+    match path {
+        "/api/chat" | "/api/generate" => {
+            let prompt_tokens = resp_json.get("prompt_eval_count").and_then(|v| v.as_u64());
+            let completion_tokens = resp_json.get("eval_count").and_then(|v| v.as_u64());
+            let eval_duration_ns = resp_json.get("eval_duration").and_then(|v| v.as_u64());
+            let tokens_per_sec = completion_tokens.zip(eval_duration_ns).and_then(|(tokens, ns)| {
+                if ns == 0 { None } else { Some(tokens as f64 / (ns as f64 / 1_000_000_000.0)) }
+            });
+            let output = if path == "/api/chat" {
+                resp_json.get("message").and_then(|m| m.get("content")).cloned()
+            } else {
+                resp_json.get("response").cloned()
+            }.unwrap_or(serde_json::Value::Null);
+            (output, prompt_tokens, completion_tokens, tokens_per_sec)
         }
-        _ => serde_json::Value::Null,
-    };
+        "/api/embed" | "/api/embeddings" | "/v1/embeddings" => {
+            (serde_json::Value::String("[embedding vector]".to_string()), None, None, None)
+        }
+        "/v1/chat/completions" => {
+            let (prompt_tokens, completion_tokens) = openai_usage(resp_json);
+            let output = resp_json
+                .get("choices").and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            (output, prompt_tokens, completion_tokens, None)
+        }
+        "/v1/completions" => {
+            let (prompt_tokens, completion_tokens) = openai_usage(resp_json);
+            let output = resp_json
+                .get("choices").and_then(|c| c.get(0))
+                .and_then(|c| c.get("text"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            (output, prompt_tokens, completion_tokens, None)
+        }
+        _ => (serde_json::Value::Null, None, None, None),
+    }
+}
 
-    (output, prompt_tokens, completion_tokens, tokens_per_sec)
+fn openai_usage(resp_json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let usage = resp_json.get("usage");
+    let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+    let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
+    (prompt_tokens, completion_tokens)
 }
 
 fn build_upstream_request(
