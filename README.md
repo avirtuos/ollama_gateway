@@ -4,13 +4,14 @@
   <img src="docs/images/admin_ui.png" alt="Ollama Gateway Admin UI" width="800"/>
 </p>
 
-An authenticated reverse proxy for [Ollama](https://ollama.com) with [Langfuse](https://langfuse.com) tracing and a web-based admin UI.
+An authenticated reverse proxy for [Ollama](https://ollama.com) and [llama.cpp](https://github.com/ggerganov/llama.cpp) with [Langfuse](https://langfuse.com) tracing and a web-based admin UI.
 
 ## Features
 
-- Bearer-token authentication for all Ollama endpoints
-- Langfuse tracing for `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`
-- Runtime management via web admin UI (tokens + Langfuse settings)
+- Bearer-token authentication for all upstream endpoints
+- Langfuse tracing for `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`
+- Supports both **Ollama** (native API) and **llama.cpp** (OpenAI-compatible API) backends
+- Runtime management via web admin UI (backend type, tokens, Langfuse settings)
 - Configuration persisted to TOML on every admin change
 
 ## Quick Start
@@ -31,6 +32,7 @@ See [`config.example.toml`](config.example.toml) for all options.
 ```toml
 [ollama]
 upstream_url = "http://localhost:11434"
+# backend_type = "ollama"   # or "llamacpp" — defaults to "ollama"
 
 [langfuse]
 enabled = false
@@ -111,10 +113,21 @@ volumes:
 Browse to `/admin/` (e.g. `http://localhost:8080/admin/`). The browser will prompt for credentials — use username `admin` and the value of `ADMIN_PASSWORD`.
 
 From the UI you can:
+- Set the upstream URL and **backend type** (Ollama or llama.cpp)
 - Enable/disable Langfuse and update all Langfuse settings
 - Add or remove Bearer tokens at runtime
+- Chat directly with the upstream model to verify connectivity
 
 All changes are persisted immediately to the TOML config file.
+
+### Backend Types
+
+| Backend | `backend_type` | Model list endpoint | Chat endpoint |
+|---------|---------------|---------------------|---------------|
+| Ollama  | `ollama`      | `GET /api/tags`     | `POST /api/chat` (NDJSON streaming) |
+| llama.cpp | `llamacpp`  | `GET /v1/models`    | `POST /v1/chat/completions` (SSE streaming) |
+
+Clients connecting to the proxy port can use either API style regardless of backend type — the transparent proxy forwards requests as-is. The backend type setting only affects the **admin UI** (model listing and the built-in chat).
 
 ## CI/CD — GitHub Secrets Required
 

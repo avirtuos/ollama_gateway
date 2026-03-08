@@ -16,7 +16,7 @@ use serde_json::json;
 use tracing::{error, info};
 
 use crate::auth::AppName;
-use crate::config::{Config, LangfuseConfig, OllamaConfig, TokenEntry};
+use crate::config::{BackendType, Config, LangfuseConfig, OllamaConfig, TokenEntry};
 use crate::langfuse::LangfuseCollector;
 use crate::proxy::proxy_handler;
 use crate::state::AppState;
@@ -215,13 +215,18 @@ async fn delete_token(
 async fn get_config(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let ollama_url = state.upstream_url.read().await.clone();
     let privacy_mode = *state.privacy_mode.read().await;
-    Json(json!({ "ollama_url": ollama_url, "privacy_mode": privacy_mode }))
+    let backend_type = match *state.backend_type.read().await {
+        BackendType::Ollama => "ollama",
+        BackendType::Llamacpp => "llamacpp",
+    };
+    Json(json!({ "ollama_url": ollama_url, "privacy_mode": privacy_mode, "backend_type": backend_type }))
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdate {
     ollama_url: String,
     privacy_mode: Option<bool>,
+    backend_type: Option<String>,
 }
 
 async fn put_config(
@@ -235,6 +240,13 @@ async fn put_config(
     {
         let mut pm = state.privacy_mode.write().await;
         *pm = body.privacy_mode.unwrap_or(false);
+    }
+    {
+        let mut bt = state.backend_type.write().await;
+        *bt = match body.backend_type.as_deref() {
+            Some("llamacpp") => BackendType::Llamacpp,
+            _ => BackendType::Ollama,
+        };
     }
 
     if let Err(e) = save_config_to_disk(&state).await {
@@ -250,21 +262,59 @@ async fn put_config(
 
 async fn get_models(State(state): State<Arc<AppState>>) -> Result<Response, StatusCode> {
     let upstream_url = state.upstream_url.read().await.clone();
-    let url = format!("{}/api/tags", upstream_url.trim_end_matches('/'));
-    let uri: Uri = url.parse().map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let upstream_req = hyper::Request::builder()
-        .method("GET")
-        .uri(uri)
-        .body(Body::empty())
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let resp = state.http_client.request(upstream_req).await.map_err(|e| {
-        error!("Upstream request failed: {}", e);
-        StatusCode::BAD_GATEWAY
-    })?;
-    Ok(ollama_response(resp))
+    let backend_type = state.backend_type.read().await.clone();
+    let base = upstream_url.trim_end_matches('/');
+
+    match backend_type {
+        BackendType::Ollama => {
+            let url = format!("{}/api/tags", base);
+            let uri: Uri = url.parse().map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let upstream_req = hyper::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let resp = state.http_client.request(upstream_req).await.map_err(|e| {
+                error!("Upstream request failed: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+            Ok(ollama_response(resp))
+        }
+        BackendType::Llamacpp => {
+            let url = format!("{}/v1/models", base);
+            let uri: Uri = url.parse().map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let upstream_req = hyper::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            let resp = state.http_client.request(upstream_req).await.map_err(|e| {
+                error!("Upstream request failed: {}", e);
+                StatusCode::BAD_GATEWAY
+            })?;
+            // Normalize /v1/models response { data: [{id}] } → { models: [{name}] }
+            let (parts, body) = resp.into_parts();
+            if parts.status.is_success() {
+                let bytes = body.collect().await.map_err(|_| StatusCode::BAD_GATEWAY)?.to_bytes();
+                let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let models: Vec<serde_json::Value> = parsed["data"]
+                    .as_array()
+                    .map(|arr| arr.iter().map(|m| json!({ "name": m["id"] })).collect())
+                    .unwrap_or_default();
+                Ok(Json(json!({ "models": models })).into_response())
+            } else {
+                let body = Body::new(body.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+                Ok(Response::from_parts(parts, body))
+            }
+        }
+    }
 }
 
 async fn get_models_running(State(state): State<Arc<AppState>>) -> Result<Response, StatusCode> {
+    let backend_type = state.backend_type.read().await.clone();
+    if backend_type == BackendType::Llamacpp {
+        return Ok(Json(json!({ "models": [] })).into_response());
+    }
     let upstream_url = state.upstream_url.read().await.clone();
     let url = format!("{}/api/ps", upstream_url.trim_end_matches('/'));
     let uri: Uri = url.parse().map_err(|_| StatusCode::BAD_GATEWAY)?;
@@ -285,6 +335,12 @@ async fn admin_chat(
     mut req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
     req.extensions_mut().insert(AppName("admin-ui".to_string()));
+    let backend_type = state.backend_type.read().await.clone();
+    if backend_type == BackendType::Llamacpp {
+        // Rewrite URI from /api/chat to /v1/chat/completions
+        let new_uri: Uri = "/v1/chat/completions".parse().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        *req.uri_mut() = new_uri;
+    }
     proxy_handler(State(state), req).await
 }
 
@@ -310,10 +366,12 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
     };
 
     let upstream_url = state.upstream_url.read().await.clone();
+    let backend_type = state.backend_type.read().await.clone();
     let privacy_mode = *state.privacy_mode.read().await;
     let config = Config {
         ollama: OllamaConfig {
-            upstream_url: upstream_url,
+            upstream_url,
+            backend_type,
         },
         langfuse,
         tokens,

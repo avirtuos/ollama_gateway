@@ -11,9 +11,24 @@ pub struct Config {
     pub server: ServerConfig,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendType {
+    Ollama,
+    Llamacpp,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        BackendType::Ollama
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OllamaConfig {
     pub upstream_url: String,
+    #[serde(default)]
+    pub backend_type: BackendType,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -109,6 +124,7 @@ impl Default for Config {
         Self {
             ollama: OllamaConfig {
                 upstream_url: "http://localhost:11434".to_string(),
+                backend_type: BackendType::default(),
             },
             langfuse: LangfuseConfig {
                 enabled: false,
@@ -172,5 +188,6 @@ listen_port = 8080
         let map = config.token_map();
         assert_eq!(map.get("sk-myapp-abc123").unwrap(), "my-frontend-app");
         assert_eq!(map.get("sk-backend-def456").unwrap(), "backend-service");
+        assert_eq!(config.ollama.backend_type, BackendType::Ollama);
     }
 }

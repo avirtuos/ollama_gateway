@@ -6,7 +6,7 @@ use axum::body::Body;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{LangfuseConfig, ServerConfig};
+use crate::config::{BackendType, LangfuseConfig, ServerConfig};
 use crate::langfuse::LangfuseCollector;
 
 pub struct AppState {
@@ -16,6 +16,7 @@ pub struct AppState {
     pub langfuse_config: Arc<RwLock<LangfuseConfig>>,
     pub langfuse_collector: Arc<RwLock<Option<Arc<LangfuseCollector>>>>,
     pub upstream_url: Arc<RwLock<String>>,
+    pub backend_type: Arc<RwLock<BackendType>>,
     pub privacy_mode: Arc<RwLock<bool>>,
     pub http_client: Client<HttpConnector, Body>,
     pub server_config: ServerConfig,
