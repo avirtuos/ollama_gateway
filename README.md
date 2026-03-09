@@ -6,6 +6,13 @@
 
 An authenticated reverse proxy for [Ollama](https://ollama.com) and [llama.cpp](https://github.com/ggerganov/llama.cpp) with [Langfuse](https://langfuse.com) tracing and a web-based admin UI.
 
+Ollama Gateway now also supports model aggregation so that you can use it to make multiple llama.cpp, vllm, or sglang instances appear as if they were one endpoint (see image below).
+
+<p align="center">
+  <img src="docs/images/model_aggregator.png" alt="Ollama Gateway Admin UI" width="800"/>
+</p>
+
+
 ## Features
 
 - Bearer-token authentication for all upstream endpoints
