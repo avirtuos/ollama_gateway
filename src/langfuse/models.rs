@@ -24,11 +24,17 @@ pub struct LangfuseEvent {
     pub tokens_per_sec: Option<f64>,
     pub ttft_ms: Option<f64>,
     pub session_id: Option<String>,
+    pub backend_name: Option<String>,
 }
 
 impl LangfuseEvent {
     pub fn into_ingestion_events(self) -> Vec<IngestionEvent> {
         let timestamp = self.start_time.to_rfc3339();
+
+        let mut tags = vec![self.app_name.clone(), self.endpoint.clone()];
+        if let Some(ref name) = self.backend_name {
+            tags.push(name.clone());
+        }
 
         let trace = IngestionEvent::IngestionEventOneOf(Box::new(IngestionEventOneOf::new(
             Uuid::new_v4().to_string(),
@@ -38,7 +44,7 @@ impl LangfuseEvent {
                 name: Some(Some(format!("{} - {}", self.app_name, self.endpoint))),
                 user_id: Some(Some(self.app_name.clone())),
                 session_id: self.session_id.clone().map(Some),
-                tags: Some(Some(vec![self.app_name.clone(), self.endpoint.clone()])),
+                tags: Some(Some(tags)),
                 timestamp: Some(Some(timestamp.clone())),
                 ..Default::default()
             },
@@ -52,14 +58,18 @@ impl LangfuseEvent {
             ..Default::default()
         }));
 
-        let metadata = match (self.tokens_per_sec, self.ttft_ms) {
-            (None, None) => None,
-            (tps, ttft) => {
-                let mut map = serde_json::Map::new();
-                if let Some(v) = tps  { map.insert("tokens_per_sec".to_string(), serde_json::json!(v)); }
-                if let Some(v) = ttft { map.insert("time_to_first_token_ms".to_string(), serde_json::json!(v)); }
-                Some(Some(serde_json::Value::Object(map)))
+        let metadata = {
+            let mut map = serde_json::Map::new();
+            if let Some(v) = self.tokens_per_sec {
+                map.insert("tokens_per_sec".to_string(), serde_json::json!(v));
             }
+            if let Some(v) = self.ttft_ms {
+                map.insert("time_to_first_token_ms".to_string(), serde_json::json!(v));
+            }
+            if let Some(ref name) = self.backend_name {
+                map.insert("backend_name".to_string(), serde_json::json!(name));
+            }
+            if map.is_empty() { None } else { Some(Some(serde_json::Value::Object(map))) }
         };
 
         let generation = IngestionEvent::IngestionEventOneOf4(Box::new(IngestionEventOneOf4::new(
@@ -107,6 +117,7 @@ mod tests {
             tokens_per_sec: Some(42.5),
             ttft_ms: Some(180.0),
             session_id: Some("session-abc".to_string()),
+            backend_name: Some("local-ollama".to_string()),
         };
         let events = event.clone().into_ingestion_events();
         assert_eq!(events.len(), 2);
@@ -120,5 +131,6 @@ mod tests {
         assert_eq!(gen_body["usage"]["unit"], "TOKENS");
         assert_eq!(gen_body["usage"]["input"], 10);
         assert_eq!(gen_body["usage"]["output"], 5);
+        assert_eq!(gen_body["metadata"]["backend_name"], "local-ollama");
     }
 }

@@ -6,6 +6,7 @@ mod error;
 mod langfuse;
 mod ollama;
 mod proxy;
+mod registry;
 mod state;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -13,7 +14,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use axum::{middleware, routing::any, Router};
 use clap::Parser;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::info;
 
 use admin::admin_router;
@@ -22,6 +23,7 @@ use config::Config;
 use connection_id::ConnectionIdLayer;
 use langfuse::LangfuseCollector;
 use proxy::proxy_handler;
+use registry::ModelRegistry;
 use state::AppState;
 
 #[derive(Parser, Debug)]
@@ -60,8 +62,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(config.server.admin_port);
 
+    let backend_names: Vec<&str> = config.backends.iter().map(|b| b.name.as_str()).collect();
     info!(
-        upstream = %config.ollama.upstream_url,
+        backends = ?backend_names,
         proxy_port,
         admin_port,
         "Starting Ollama Gateway",
@@ -79,19 +82,37 @@ async fn main() -> anyhow::Result<()> {
 
     let http_client = Client::builder(TokioExecutor::new()).build_http();
 
+    // Build initial model registry
+    info!("Building initial model registry...");
+    let initial_registry = ModelRegistry::refresh(&http_client, &config.backends).await;
+    let healthy_count = initial_registry.all_healthy_backends().len();
+    info!(backends = config.backends.len(), healthy = healthy_count, "Model registry initialized");
+
+    let registry_refresh_notify = Arc::new(Notify::new());
+
     let state = Arc::new(AppState {
         config_path: cli.config.clone(),
         admin_password,
         token_map: Arc::new(RwLock::new(config.token_map())),
         langfuse_config: Arc::new(RwLock::new(config.langfuse.clone())),
         langfuse_collector: Arc::new(RwLock::new(langfuse_collector.clone())),
-        upstream_url: Arc::new(RwLock::new(config.ollama.upstream_url.clone())),
-        backend_type: Arc::new(RwLock::new(config.ollama.backend_type.clone())),
+        backends: Arc::new(RwLock::new(config.backends.clone())),
+        model_registry: Arc::new(RwLock::new(initial_registry)),
         privacy_mode: Arc::new(RwLock::new(config.server.privacy_mode)),
-        http_client,
+        http_client: http_client.clone(),
         server_config: config.server.clone(),
         config_write_lock: Mutex::new(()),
+        registry_refresh_notify: registry_refresh_notify.clone(),
     });
+
+    // Background registry refresh task
+    {
+        let state = state.clone();
+        let refresh_interval_secs = config.server.model_refresh_interval_secs;
+        tokio::spawn(async move {
+            registry_refresh_loop(state, refresh_interval_secs, registry_refresh_notify).await;
+        });
+    }
 
     // Proxy app — Bearer token auth, all Ollama traffic
     let proxy_app = Router::new()
@@ -142,9 +163,9 @@ async fn main() -> anyhow::Result<()> {
             admin_app.into_make_service_with_connect_info::<SocketAddr>(),
         ),
     )
-        .with_graceful_shutdown(async move {
-            shutdown_rx2.wait_for(|v| *v).await.ok();
-        });
+    .with_graceful_shutdown(async move {
+        shutdown_rx2.wait_for(|v| *v).await.ok();
+    });
 
     tokio::try_join!(proxy_server, admin_server)?;
 
@@ -156,4 +177,32 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Ollama Gateway stopped");
     Ok(())
+}
+
+async fn registry_refresh_loop(
+    state: Arc<AppState>,
+    refresh_interval_secs: u64,
+    notify: Arc<Notify>,
+) {
+    let interval = std::time::Duration::from_secs(refresh_interval_secs);
+    loop {
+        // Wait for whichever comes first: the timer or a manual trigger
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                tracing::debug!("Periodic registry refresh triggered");
+            }
+            _ = notify.notified() => {
+                tracing::debug!("Manual registry refresh triggered");
+            }
+        }
+
+        let backends = state.backends.read().await.clone();
+        let new_registry = ModelRegistry::refresh(&state.http_client, &backends).await;
+        let healthy = new_registry.all_healthy_backends().len();
+        let total = new_registry.backends.len();
+        tracing::info!(healthy, total, "Model registry refreshed");
+
+        let mut reg = state.model_registry.write().await;
+        *reg = new_registry;
+    }
 }

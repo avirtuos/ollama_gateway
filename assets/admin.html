@@ -13,7 +13,7 @@
   .tab { background: transparent; border: 1px solid rgba(255,255,255,.3); color: rgba(255,255,255,.75); padding: .35rem .85rem; border-radius: 5px; font-size: .88rem; font-weight: 500; cursor: pointer; transition: background .15s, color .15s; }
   .tab:hover { background: rgba(255,255,255,.1); color: #fff; }
   .tab.active { background: #fff; color: #1a1a2e; border-color: #fff; }
-  main { max-width: 860px; margin: 2rem auto; padding: 0 1rem; display: flex; flex-direction: column; gap: 2rem; }
+  main { max-width: 900px; margin: 2rem auto; padding: 0 1rem; display: flex; flex-direction: column; gap: 2rem; }
   section { background: #fff; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.1); padding: 1.5rem; }
   section h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 1.2rem; border-bottom: 1px solid #e5e7eb; padding-bottom: .6rem; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem 1.2rem; }
@@ -35,6 +35,7 @@
   .btn-primary { background: #4f46e5; color: #fff; }
   .btn-danger  { background: #dc2626; color: #fff; }
   .btn-success { background: #16a34a; color: #fff; }
+  .btn-secondary { background: #6b7280; color: #fff; }
   .btn-row { margin-top: 1rem; display: flex; gap: .6rem; align-items: center; }
   table { width: 100%; border-collapse: collapse; font-size: .88rem; }
   th { text-align: left; padding: .5rem .75rem; background: #f9fafb; font-size: .8rem;
@@ -48,6 +49,16 @@
     font-size: .85rem; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 999; }
   #status-bar.show { opacity: 1; }
   .empty-msg { text-align: center; color: #9ca3af; padding: 1.5rem; font-size: .88rem; }
+  /* Health badges */
+  .badge { display: inline-block; padding: .15rem .5rem; border-radius: 9999px; font-size: .75rem; font-weight: 600; font-family: system-ui; }
+  .badge-green { background: #dcfce7; color: #15803d; }
+  .badge-red   { background: #fee2e2; color: #b91c1c; }
+  /* Backend modal */
+  .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 100; align-items: center; justify-content: center; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: #fff; border-radius: 10px; padding: 1.8rem; width: min(520px, 95vw); box-shadow: 0 8px 32px rgba(0,0,0,.2); }
+  .modal h3 { font-size: 1rem; font-weight: 600; margin-bottom: 1.2rem; }
+  .modal .btn-row { justify-content: flex-end; }
   /* Chat */
   .chat-toolbar { display: flex; gap: .7rem; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; }
   .chat-toolbar label { white-space: nowrap; }
@@ -66,6 +77,7 @@
   <h1>Ollama Gateway — Admin</h1>
   <nav class="tab-bar">
     <button class="tab active" data-tab="settings" onclick="showTab('settings')">Settings</button>
+    <button class="tab" data-tab="backends" onclick="showTab('backends')">Backends</button>
     <button class="tab" data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
     <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
   </nav>
@@ -75,19 +87,8 @@
   <!-- Settings Tab -->
   <div id="tab-settings">
     <section>
-      <h2>Ollama Settings</h2>
+      <h2>Gateway Settings</h2>
       <div class="form-grid">
-        <div class="form-group" style="flex:1">
-          <label for="ollama-url">Upstream URL</label>
-          <input type="text" id="ollama-url" placeholder="http://localhost:11434">
-        </div>
-        <div class="form-group" style="flex:0 0 auto">
-          <label for="backend-type">Backend Type</label>
-          <select id="backend-type">
-            <option value="ollama">Ollama</option>
-            <option value="llamacpp">llama.cpp</option>
-          </select>
-        </div>
         <div class="form-group full">
           <div class="checkbox-row">
             <input type="checkbox" id="privacy-mode">
@@ -96,7 +97,7 @@
         </div>
       </div>
       <div class="btn-row">
-        <button class="btn btn-primary" onclick="saveOllamaConfig()">Save</button>
+        <button class="btn btn-primary" onclick="saveConfig()">Save</button>
       </div>
     </section>
     <section>
@@ -131,6 +132,31 @@
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="saveLangfuse()">Save Settings</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- Backends Tab -->
+  <div id="tab-backends" style="display:none">
+    <section>
+      <h2>Backends</h2>
+      <table id="backends-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>URL</th>
+            <th>Type</th>
+            <th>Priority</th>
+            <th>Health</th>
+            <th>Models</th>
+            <th style="width:140px"></th>
+          </tr>
+        </thead>
+        <tbody id="backends-body"></tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn btn-success" onclick="openBackendModal()">Add Backend</button>
+        <button class="btn btn-secondary" onclick="triggerRefresh()">Refresh Models</button>
       </div>
     </section>
   </div>
@@ -176,11 +202,43 @@
   </div>
 </main>
 
+<!-- Backend Add/Edit Modal -->
+<div class="modal-backdrop" id="backend-modal">
+  <div class="modal">
+    <h3 id="modal-title">Add Backend</h3>
+    <div class="form-grid">
+      <div class="form-group">
+        <label for="be-name">Name</label>
+        <input type="text" id="be-name" placeholder="local-ollama">
+      </div>
+      <div class="form-group">
+        <label for="be-priority">Priority (lower = preferred)</label>
+        <input type="number" id="be-priority" value="0" min="0">
+      </div>
+      <div class="form-group full">
+        <label for="be-url">URL</label>
+        <input type="text" id="be-url" placeholder="http://localhost:11434">
+      </div>
+      <div class="form-group">
+        <label for="be-type">Backend Type</label>
+        <select id="be-type">
+          <option value="ollama">Ollama</option>
+          <option value="llamacpp">llama.cpp</option>
+        </select>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveBackend()">Save</button>
+      <button class="btn btn-secondary" onclick="closeBackendModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div id="status-bar"></div>
 
 <script>
   let password = null;
-  let currentBackendType = 'ollama';
+  let editingBackendName = null; // null = adding, string = editing
 
   function authHeader() {
     return 'Basic ' + btoa('admin:' + (password || ''));
@@ -209,34 +267,28 @@
   }
 
   function showTab(name) {
-    ['settings', 'tokens', 'chat'].forEach(t => {
+    ['settings', 'backends', 'tokens', 'chat'].forEach(t => {
       document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
       document.querySelector(`.tab[data-tab="${t}"]`).classList.toggle('active', t === name);
     });
+    if (name === 'backends') loadBackends();
     if (name === 'chat') loadModels();
   }
 
-  // --- Ollama ---
+  // --- Settings ---
 
-  async function loadOllamaConfig() {
+  async function loadConfig() {
     const resp = await apiFetch('/api/config');
-    if (!resp.ok) { showStatus('Failed to load Ollama config', false); return; }
+    if (!resp.ok) { showStatus('Failed to load config', false); return; }
     const d = await resp.json();
-    document.getElementById('ollama-url').value = d.ollama_url || '';
     document.getElementById('privacy-mode').checked = !!d.privacy_mode;
-    currentBackendType = d.backend_type || 'ollama';
-    document.getElementById('backend-type').value = currentBackendType;
   }
 
-  async function saveOllamaConfig() {
-    const ollama_url = document.getElementById('ollama-url').value.trim();
-    if (!ollama_url) { showStatus('Ollama URL is required', false); return; }
+  async function saveConfig() {
     const privacy_mode = document.getElementById('privacy-mode').checked;
-    const backend_type = document.getElementById('backend-type').value;
-    currentBackendType = backend_type;
-    const resp = await apiFetch('/api/config', { method: 'PUT', body: JSON.stringify({ ollama_url, privacy_mode, backend_type }) });
-    if (resp.ok) { showStatus('Ollama settings saved'); }
-    else         { showStatus('Failed to save Ollama settings', false); }
+    const resp = await apiFetch('/api/config', { method: 'PUT', body: JSON.stringify({ privacy_mode }) });
+    if (resp.ok) { showStatus('Settings saved'); }
+    else         { showStatus('Failed to save settings', false); }
   }
 
   // --- Langfuse ---
@@ -265,6 +317,89 @@
     const resp = await apiFetch('/api/langfuse', { method: 'PUT', body: JSON.stringify(body) });
     if (resp.ok) { showStatus('Langfuse settings saved'); }
     else         { showStatus('Failed to save Langfuse settings', false); }
+  }
+
+  // --- Backends ---
+
+  async function loadBackends() {
+    const resp = await apiFetch('/api/backends');
+    if (!resp.ok) { showStatus('Failed to load backends', false); return; }
+    const backends = await resp.json();
+    const tbody = document.getElementById('backends-body');
+    if (!backends || backends.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-msg">No backends configured</td></tr>';
+      return;
+    }
+    tbody.innerHTML = backends.map(b => `
+      <tr>
+        <td>${esc(b.name)}</td>
+        <td>${esc(b.url)}</td>
+        <td>${esc(b.backend_type)}</td>
+        <td>${b.priority}</td>
+        <td><span class="badge ${b.healthy ? 'badge-green' : 'badge-red'}">${b.healthy ? 'healthy' : 'down'}</span></td>
+        <td>${b.model_count}</td>
+        <td>
+          <button class="btn btn-primary" style="padding:.3rem .6rem;font-size:.78rem" onclick="openBackendModal(${esc(JSON.stringify(b))})">Edit</button>
+          <button class="btn btn-danger"  style="padding:.3rem .6rem;font-size:.78rem" onclick="removeBackend('${esc(b.name)}')">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  function openBackendModal(existing) {
+    editingBackendName = existing ? existing.name : null;
+    document.getElementById('modal-title').textContent = existing ? 'Edit Backend' : 'Add Backend';
+    document.getElementById('be-name').value     = existing ? existing.name : '';
+    document.getElementById('be-url').value      = existing ? existing.url : '';
+    document.getElementById('be-type').value     = existing ? existing.backend_type : 'ollama';
+    document.getElementById('be-priority').value = existing ? existing.priority : 0;
+    document.getElementById('backend-modal').classList.add('open');
+  }
+
+  function closeBackendModal() {
+    document.getElementById('backend-modal').classList.remove('open');
+    editingBackendName = null;
+  }
+
+  async function saveBackend() {
+    const body = {
+      name:         document.getElementById('be-name').value.trim(),
+      url:          document.getElementById('be-url').value.trim(),
+      backend_type: document.getElementById('be-type').value,
+      priority:     parseInt(document.getElementById('be-priority').value) || 0,
+    };
+    if (!body.name || !body.url) { showStatus('Name and URL are required', false); return; }
+
+    let resp;
+    if (editingBackendName) {
+      resp = await apiFetch('/api/backends/' + encodeURIComponent(editingBackendName), {
+        method: 'PUT', body: JSON.stringify(body),
+      });
+    } else {
+      resp = await apiFetch('/api/backends', { method: 'POST', body: JSON.stringify(body) });
+    }
+
+    if (resp.ok) {
+      showStatus(editingBackendName ? 'Backend updated' : 'Backend added');
+      closeBackendModal();
+      loadBackends();
+    } else {
+      const err = await resp.json().catch(() => ({}));
+      showStatus(err.error || 'Failed to save backend', false);
+    }
+  }
+
+  async function removeBackend(name) {
+    if (!confirm('Delete backend: ' + name + '?')) return;
+    const resp = await apiFetch('/api/backends/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (resp.ok) { showStatus('Backend deleted'); loadBackends(); }
+    else         { showStatus('Failed to delete backend', false); }
+  }
+
+  async function triggerRefresh() {
+    const resp = await apiFetch('/api/backends/refresh', { method: 'POST' });
+    if (resp.ok) { showStatus('Registry refresh triggered'); setTimeout(loadBackends, 2000); }
+    else         { showStatus('Failed to trigger refresh', false); }
   }
 
   // --- Tokens ---
@@ -321,19 +456,14 @@
     const select = document.getElementById('chat-model');
     select.innerHTML = '<option value="">Loading…</option>';
     try {
-      const [modelsResp, runningResp] = await Promise.all([
-        apiFetch('/api/models'),
-        apiFetch('/api/models/running'),
-      ]);
-      const modelsData  = modelsResp.ok  ? await modelsResp.json()  : { models: [] };
-      const runningData = runningResp.ok ? await runningResp.json() : { models: [] };
-      const allModels   = (modelsData.models  || []).map(m => m.name);
-      const runningName = currentBackendType === 'llamacpp' ? null : (runningData.models || [])[0]?.name;
+      const resp = await apiFetch('/api/models');
+      const data = resp.ok ? await resp.json() : { models: [] };
+      const allModels = (data.models || []).map(m => m.name);
       if (allModels.length === 0) {
         select.innerHTML = '<option value="">No models found</option>';
       } else {
         select.innerHTML = allModels.map(name =>
-          `<option value="${esc(name)}"${name === runningName ? ' selected' : ''}>${esc(name)}</option>`
+          `<option value="${esc(name)}">${esc(name)}</option>`
         ).join('');
       }
     } catch (e) {
@@ -358,8 +488,8 @@
 
   async function sendMessage() {
     if (chatStreaming) return;
-    const input  = document.getElementById('chat-input');
-    const model  = document.getElementById('chat-model').value;
+    const input   = document.getElementById('chat-input');
+    const model   = document.getElementById('chat-model').value;
     const content = input.value.trim();
     if (!content) return;
     if (!model) { showStatus('Please select a model', false); return; }
@@ -395,27 +525,23 @@
           for (const line of lines) {
             if (!line.trim()) continue;
             try {
-              if (currentBackendType === 'llamacpp') {
-                // SSE format: "data: {...}" or "data: [DONE]"
-                if (!line.startsWith('data: ')) continue;
+              // Auto-detect format: SSE (llamacpp) or NDJSON (ollama)
+              if (line.startsWith('data: ')) {
                 const data = line.slice(6);
                 if (data === '[DONE]') continue;
                 const chunk = JSON.parse(data);
-                const content = chunk.choices?.[0]?.delta?.content;
-                if (content) {
-                  assistantContent += content;
+                const delta = chunk.choices?.[0]?.delta?.content;
+                if (delta) {
+                  assistantContent += delta;
                   assistantDiv.textContent = assistantContent;
-                  const area = document.getElementById('chat-messages');
-                  area.scrollTop = area.scrollHeight;
+                  document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
                 }
               } else {
-                // Ollama NDJSON format
                 const chunk = JSON.parse(line);
                 if (chunk.message?.content) {
                   assistantContent += chunk.message.content;
                   assistantDiv.textContent = assistantContent;
-                  const area = document.getElementById('chat-messages');
-                  area.scrollTop = area.scrollHeight;
+                  document.getElementById('chat-messages').scrollTop = document.getElementById('chat-messages').scrollHeight;
                 }
               }
             } catch {}
@@ -433,13 +559,19 @@
   }
 
   function esc(s) {
+    if (typeof s === 'object') return JSON.stringify(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+
+  // Close modal on backdrop click
+  document.getElementById('backend-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeBackendModal();
+  });
 
   // Initial load
   (async () => {
     password = prompt('Enter admin password:') ?? '';
-    await Promise.all([loadOllamaConfig(), loadLangfuse(), loadTokens()]);
+    await Promise.all([loadConfig(), loadLangfuse(), loadTokens()]);
   })();
 </script>
 </body>

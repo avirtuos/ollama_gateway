@@ -1,5 +1,15 @@
-[ollama]
-upstream_url = "http://localhost:11434"
+[[backends]]
+name = "local-ollama"
+url = "http://localhost:11434"
+backend_type = "ollama"
+priority = 0
+
+# Add more backends as needed:
+# [[backends]]
+# name = "remote-gpu"
+# url = "http://gpu-server:8080"
+# backend_type = "llamacpp"
+# priority = 10
 
 [langfuse]
 enabled = true
@@ -21,3 +31,4 @@ app_name = "backend-service"
 listen_addr = "0.0.0.0"
 listen_port = 8080
 admin_port  = 8081
+model_refresh_interval_secs = 60

@@ -9,15 +9,19 @@ use axum::{
 use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::BodyExt;
+use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use axum::response::IntoResponse;
 
 use crate::{
     auth::{AppName, BearerToken},
+    config::{BackendConfig, BackendType},
     connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
-
+    registry::ModelRegistry,
     state::AppState,
 };
 
@@ -26,6 +30,38 @@ const TRACED_PATHS: &[&str] = &[
     "/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
     "/v1/chat/completions", "/v1/completions", "/v1/embeddings",
 ];
+
+/// How to route a request path.
+enum RouteCategory {
+    /// Extract model from body → route to single backend.
+    Inference,
+    /// `/api/show` — extract model or name from body → single backend.
+    ModelInfo,
+    /// `/api/tags`, `/v1/models` — fan out to all healthy backends, merge.
+    ModelList,
+    /// `/api/ps` — fan out to all Ollama backends, merge.
+    RunningModels,
+    /// `/api/pull` etc. — try model lookup; fall back to default.
+    OtherWithModel,
+    /// Everything else — route to default backend.
+    Passthrough,
+}
+
+fn classify_path(path: &str) -> RouteCategory {
+    // Strip query string for matching
+    let p = path.split('?').next().unwrap_or(path);
+    match p {
+        "/api/chat" | "/api/generate" | "/api/embed" | "/api/embeddings"
+        | "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" => RouteCategory::Inference,
+        "/api/show" => RouteCategory::ModelInfo,
+        "/api/tags" | "/v1/models" => RouteCategory::ModelList,
+        "/api/ps" => RouteCategory::RunningModels,
+        "/api/pull" | "/api/push" | "/api/copy" | "/api/delete" | "/api/create" => {
+            RouteCategory::OtherWithModel
+        }
+        _ => RouteCategory::Passthrough,
+    }
+}
 
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
@@ -62,16 +98,8 @@ pub async fn proxy_handler(
         None => info!(method = %method, url = %url, remote = %remote, session = %session_id, app = %app_name, "→"),
     }
 
-    let collector = state.langfuse_collector.read().await.clone();
-    let on_traced_path = TRACED_PATHS.iter().any(|p| url == *p || url.starts_with(p));
-    let should_trace = collector.is_some() && on_traced_path;
-    let log_content = !privacy_mode && on_traced_path;
-
-    let result = if should_trace || log_content {
-        proxy_with_tracing(state, collector, req, log_content).await
-    } else {
-        proxy_passthrough(state, req).await
-    };
+    let path = req.uri().path().to_string();
+    let result = dispatch(state, req, &path, &app_name, &session_id, privacy_mode).await;
 
     match &result {
         Ok(resp) => match &token_field {
@@ -87,18 +115,93 @@ pub async fn proxy_handler(
     result
 }
 
-/// Zero-copy passthrough for non-traced endpoints.
-async fn proxy_passthrough(
+async fn dispatch(
     state: Arc<AppState>,
     req: Request<Body>,
+    path: &str,
+    app_name: &str,
+    session_id: &str,
+    privacy_mode: bool,
 ) -> Result<Response<Body>, StatusCode> {
-    let upstream_url = state.upstream_url.read().await.clone();
-    let upstream_req = build_upstream_request(&upstream_url, req).map_err(|e| {
+    let registry = state.model_registry.read().await.clone();
+
+    match classify_path(path) {
+        RouteCategory::ModelList => proxy_aggregate_models(&state, &registry, path).await,
+        RouteCategory::RunningModels => proxy_aggregate_ps(&state, &registry).await,
+
+        category @ (RouteCategory::Inference | RouteCategory::ModelInfo | RouteCategory::OtherWithModel) => {
+            // Buffer body to extract model name
+            let (parts, body) = req.into_parts();
+            let req_bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+            let req_json: Option<serde_json::Value> = serde_json::from_slice(&req_bytes).ok();
+
+            // Try both "model" and "name" keys
+            let model_name = req_json.as_ref().and_then(|j| {
+                j.get("model").or_else(|| j.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string())
+            });
+
+            let resolved = model_name.as_deref().and_then(|m| registry.resolve_backend(m));
+
+            // Warn if inference request's model isn't in registry
+            if matches!(category, RouteCategory::Inference) {
+                if let Some(ref m) = model_name {
+                    if resolved.is_none() {
+                        warn!(model = %m, "Model not found in registry, routing to default backend");
+                    }
+                }
+            }
+
+            let backend = match resolved.or_else(|| registry.default_backend()) {
+                Some(b) => b.clone(),
+                None => {
+                    let model_str = model_name.as_deref().unwrap_or("unknown");
+                    warn!(model = model_str, "No healthy backend found");
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+            };
+
+            let collector = state.langfuse_collector.read().await.clone();
+            let on_traced_path = TRACED_PATHS.iter().any(|p| path == *p || path.starts_with(p));
+            let should_trace = collector.is_some() && on_traced_path;
+            let log_content = !privacy_mode && on_traced_path;
+
+            let rebuilt = Request::from_parts(parts, Body::from(req_bytes));
+            if should_trace || log_content {
+                proxy_with_tracing_buffered(
+                    state, collector, rebuilt, req_json,
+                    &backend, log_content, app_name.to_string(),
+                    Some(session_id.to_string()),
+                ).await
+            } else {
+                proxy_single(&state.http_client, rebuilt, &backend.url).await
+            }
+        }
+
+        RouteCategory::Passthrough => {
+            let backend = match registry.default_backend() {
+                Some(b) => b.clone(),
+                None => {
+                    error!("No healthy backend available for passthrough");
+                    return Err(StatusCode::BAD_GATEWAY);
+                }
+            };
+            proxy_single(&state.http_client, req, &backend.url).await
+        }
+    }
+}
+
+/// Route a single request to one upstream backend.
+async fn proxy_single(
+    http_client: &hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+    req: Request<Body>,
+    upstream_url: &str,
+) -> Result<Response<Body>, StatusCode> {
+    let upstream_req = build_upstream_request(upstream_url, req).map_err(|e| {
         error!("Failed to build upstream request: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
 
-    let resp = state.http_client.request(upstream_req).await.map_err(|e| {
+    let resp = http_client.request(upstream_req).await.map_err(|e| {
         error!("Upstream request failed: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
@@ -106,46 +209,144 @@ async fn proxy_passthrough(
     Ok(convert_response(resp))
 }
 
-/// Proxy with body buffering for Langfuse tracing and/or content logging.
-async fn proxy_with_tracing(
+/// Fan out to all healthy backends, aggregate their model lists.
+async fn proxy_aggregate_models(
+    state: &Arc<AppState>,
+    registry: &Arc<ModelRegistry>,
+    path: &str,
+) -> Result<Response<Body>, StatusCode> {
+    let healthy = registry.all_healthy_backends();
+    if healthy.is_empty() {
+        return Ok(axum::Json(json!({ "error": "no healthy backends available" })).into_response());
+    }
+
+    // Collect model metadata from each backend
+    let mut tasks = tokio::task::JoinSet::new();
+    for backend in healthy {
+        let url = backend.config.url.clone();
+        let bt = backend.config.backend_type.clone();
+        let client = state.http_client.clone();
+        tasks.spawn(async move {
+            let target = match bt {
+                BackendType::Ollama => format!("{}/api/tags", url.trim_end_matches('/')),
+                BackendType::Llamacpp => format!("{}/v1/models", url.trim_end_matches('/')),
+            };
+            let uri: Uri = target.parse().ok()?;
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .ok()?;
+            let resp = client.request(req).await.ok()?;
+            let (parts, body) = resp.into_parts();
+            if !parts.status.is_success() { return None; }
+            let bytes = body.collect().await.ok()?.to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some((bt, json))
+        });
+    }
+
+    // Merge results — deduplicate by name, first seen wins (backends are priority-sorted)
+    let mut seen = std::collections::HashSet::new();
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+
+    while let Some(join_result) = tasks.join_next().await {
+        let Some(Some((bt, json))) = join_result.ok() else { continue };
+        let models_arr = match bt {
+            BackendType::Ollama => json["models"].as_array().cloned().unwrap_or_default(),
+            BackendType::Llamacpp => {
+                // Normalize {data:[{id}]} → [{name}]
+                json["data"].as_array().map(|arr| {
+                    arr.iter().map(|m| json!({ "name": m["id"] })).collect()
+                }).unwrap_or_default()
+            }
+        };
+        for model in models_arr {
+            if let Some(name) = model.get("name").and_then(|n| n.as_str()) {
+                if seen.insert(name.to_string()) {
+                    merged.push(model);
+                }
+            }
+        }
+    }
+
+    // For /v1/models return OpenAI format; for /api/tags return Ollama format
+    let resp_json = if path == "/v1/models" {
+        let data: Vec<serde_json::Value> = merged.iter().map(|m| {
+            let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            json!({ "id": name, "object": "model" })
+        }).collect();
+        json!({ "object": "list", "data": data })
+    } else {
+        json!({ "models": merged })
+    };
+
+    Ok(axum::Json(resp_json).into_response())
+}
+
+/// Fan out `/api/ps` to all healthy Ollama backends, merge running model lists.
+async fn proxy_aggregate_ps(
+    state: &Arc<AppState>,
+    registry: &Arc<ModelRegistry>,
+) -> Result<Response<Body>, StatusCode> {
+    let ollama_backends = registry.all_healthy_ollama_backends();
+    if ollama_backends.is_empty() {
+        return Ok(axum::Json(json!({ "models": [] })).into_response());
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for backend in ollama_backends {
+        let url = format!("{}/api/ps", backend.config.url.trim_end_matches('/'));
+        let client = state.http_client.clone();
+        tasks.spawn(async move {
+            let uri: Uri = url.parse().ok()?;
+            let req = hyper::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .ok()?;
+            let resp = client.request(req).await.ok()?;
+            let (parts, body) = resp.into_parts();
+            if !parts.status.is_success() { return None; }
+            let bytes = body.collect().await.ok()?.to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            json["models"].as_array().cloned()
+        });
+    }
+
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    while let Some(join_result) = tasks.join_next().await {
+        if let Ok(Some(models)) = join_result {
+            merged.extend(models);
+        }
+    }
+
+    Ok(axum::Json(json!({ "models": merged })).into_response())
+}
+
+/// Proxy with body already buffered; handles tracing and content logging.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_with_tracing_buffered(
     state: Arc<AppState>,
     collector: Option<Arc<LangfuseCollector>>,
     req: Request<Body>,
+    req_json: Option<serde_json::Value>,
+    backend: &BackendConfig,
     log_content: bool,
+    app_name: String,
+    session_id: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
-    let app_name = req
-        .extensions()
-        .get::<AppName>()
-        .map(|a| a.0.clone())
-        .unwrap_or_default();
-
-    let session_id = req
-        .extensions()
-        .get::<ConnectionId>()
-        .map(|c| c.0.clone());
-
     let path = req.uri().path().to_string();
     let start_time = Utc::now();
+    let backend_name = backend.name.clone();
 
-    // Buffer request body
-    let (parts, body) = req.into_parts();
-    let req_bytes = body
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
-
-    let req_json: Option<serde_json::Value> = serde_json::from_slice(&req_bytes).ok();
     // OpenAI-compatible paths default stream=false; native Ollama paths default stream=true
     let stream_default = !path.starts_with("/v1/");
     let streaming = req_json.as_ref().map(|body| {
         body.get("stream").and_then(|v| v.as_bool()).unwrap_or(stream_default)
     }).unwrap_or(stream_default);
 
-    // Rebuild request with buffered body
-    let upstream_url = state.upstream_url.read().await.clone();
-    let rebuilt = Request::from_parts(parts, Body::from(req_bytes.clone()));
-    let upstream_req = build_upstream_request(&upstream_url, rebuilt).map_err(|e| {
+    let upstream_req = build_upstream_request(&backend.url, req).map_err(|e| {
         error!("Failed to build upstream request: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
@@ -156,9 +357,9 @@ async fn proxy_with_tracing(
     })?;
 
     if streaming {
-        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content).await
+        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
     } else {
-        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content).await
+        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
     }
 }
 
@@ -171,6 +372,7 @@ async fn handle_non_streaming_response(
     start_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
     log_content: bool,
+    backend_name: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
     let resp_bytes = resp_body
@@ -192,7 +394,6 @@ async fn handle_non_streaming_response(
         }
     }
 
-    // Parse and emit trace event in background
     if let Some(collector) = &collector {
         if let Some(event) = build_trace_event(
             &req_json,
@@ -202,6 +403,7 @@ async fn handle_non_streaming_response(
             start_time,
             end_time,
             session_id,
+            backend_name,
         ) {
             debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
             collector.send(event);
@@ -222,12 +424,12 @@ async fn handle_streaming_response(
     start_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
     log_content: bool,
+    backend_name: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
-    // Spawn task to forward chunks and accumulate for tracing
     tokio::spawn(async move {
         let mut accumulated = Vec::<u8>::new();
         let mut stream = resp_body;
@@ -242,7 +444,6 @@ async fn handle_streaming_response(
                         }
                         accumulated.extend_from_slice(&data);
                         if tx.send(Ok(data)).await.is_err() {
-                            // Client disconnected
                             break;
                         }
                     }
@@ -258,7 +459,6 @@ async fn handle_streaming_response(
             }
         }
 
-        // Stream done — log and/or emit trace
         let end_time = Utc::now();
         let ttft_ms = first_chunk_time
             .map(|t| (t - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0);
@@ -283,6 +483,7 @@ async fn handle_streaming_response(
                 end_time,
                 session_id,
                 ttft_ms,
+                backend_name,
             ) {
                 debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, ttft_ms = ?event.ttft_ms, "queuing trace event");
                 collector.send(event);
@@ -295,6 +496,7 @@ async fn handle_streaming_response(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_trace_event(
     req_json: &Option<serde_json::Value>,
     resp_bytes: &Bytes,
@@ -303,6 +505,7 @@ fn build_trace_event(
     start_time: chrono::DateTime<chrono::Utc>,
     end_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
+    backend_name: Option<String>,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
     let resp_json: serde_json::Value = serde_json::from_slice(resp_bytes).ok()?;
@@ -331,9 +534,11 @@ fn build_trace_event(
         tokens_per_sec,
         ttft_ms: None,
         session_id,
+        backend_name,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_trace_event_from_stream(
     req_json: &Option<serde_json::Value>,
     accumulated: &Bytes,
@@ -343,6 +548,7 @@ fn build_trace_event_from_stream(
     end_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
     ttft_ms: Option<f64>,
+    backend_name: Option<String>,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
 
@@ -361,15 +567,12 @@ fn build_trace_event_from_stream(
         return None;
     }
 
-    // Extract token counts and output text depending on API format
     let (prompt_tokens, completion_tokens, tokens_per_sec) = if path.starts_with("/v1/") {
-        // OpenAI: usage may appear in a trailing chunk when stream_options.include_usage=true
         let usage = chunks.iter().find_map(|c| c.get("usage"));
         let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
         let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
         (prompt_tokens, completion_tokens, None)
     } else {
-        // Native Ollama: stats are in the done chunk
         let done = chunks.iter().find(|c| c.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
         let prompt_tokens = done.and_then(|d| d.get("prompt_eval_count")).and_then(|v| v.as_u64());
         let completion_tokens = done.and_then(|d| d.get("eval_count")).and_then(|v| v.as_u64());
@@ -429,6 +632,7 @@ fn build_trace_event_from_stream(
         tokens_per_sec,
         ttft_ms,
         session_id,
+        backend_name,
     })
 }
 
@@ -559,7 +763,7 @@ fn openai_usage(resp_json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
     (prompt_tokens, completion_tokens)
 }
 
-fn build_upstream_request(
+pub fn build_upstream_request(
     upstream_url: &str,
     req: Request<Body>,
 ) -> Result<hyper::Request<Body>, Box<dyn std::error::Error + Send + Sync>> {
@@ -578,9 +782,6 @@ fn build_upstream_request(
         .method(parts.method)
         .uri(uri);
 
-    // Forward headers, skipping hop-by-hop headers
-    // Strip hop-by-hop headers and browser-side headers that confuse Ollama's
-    // CORS check (Origin/Referer cause 403 when the client is on a remote host).
     let skip = ["host", "connection", "transfer-encoding", "authorization", "origin", "referer"];
     for (name, value) in &parts.headers {
         if !skip.contains(&name.as_str()) {
