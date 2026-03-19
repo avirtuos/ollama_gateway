@@ -134,7 +134,22 @@ async fn dispatch(
             // Buffer body to extract model name
             let (parts, body) = req.into_parts();
             let req_bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-            let req_json: Option<serde_json::Value> = serde_json::from_slice(&req_bytes).ok();
+            let mut req_json: Option<serde_json::Value> = serde_json::from_slice(&req_bytes).ok();
+
+            // Inject stream_options.include_usage for /v1/ streaming so the backend
+            // includes a usage chunk in the final SSE frame, which extract_streaming_stats() can parse.
+            let req_bytes = if path.starts_with("/v1/")
+                && req_json.as_ref().and_then(|j| j.get("stream")).and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                if let Some(ref mut json) = req_json {
+                    json["stream_options"] = serde_json::json!({"include_usage": true});
+                    serde_json::to_vec(json).map(bytes::Bytes::from).unwrap_or(req_bytes)
+                } else {
+                    req_bytes
+                }
+            } else {
+                req_bytes
+            };
 
             // Try both "model" and "name" keys
             let model_name = req_json.as_ref().and_then(|j| {
@@ -827,8 +842,13 @@ fn extract_output(
             }.unwrap_or(serde_json::Value::Null);
             (output, prompt_tokens, completion_tokens, tokens_per_sec)
         }
-        "/api/embed" | "/api/embeddings" | "/v1/embeddings" => {
-            (serde_json::Value::String("[embedding vector]".to_string()), None, None, None)
+        "/api/embed" | "/api/embeddings" => {
+            let prompt_tokens = resp_json.get("prompt_eval_count").and_then(|v| v.as_u64());
+            (serde_json::Value::String("[embedding vector]".to_string()), prompt_tokens, None, None)
+        }
+        "/v1/embeddings" => {
+            let prompt_tokens = resp_json.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+            (serde_json::Value::String("[embedding vector]".to_string()), prompt_tokens, None, None)
         }
         "/v1/chat/completions" => {
             let (prompt_tokens, completion_tokens) = openai_usage(resp_json);
