@@ -21,6 +21,7 @@ use crate::{
     config::{BackendConfig, BackendType},
     connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
+    metrics::{MetricsCollector, MetricsRecord},
     registry::ModelRegistry,
     state::AppState,
 };
@@ -166,7 +167,7 @@ async fn dispatch(
             let log_content = !privacy_mode && on_traced_path;
 
             let rebuilt = Request::from_parts(parts, Body::from(req_bytes));
-            if should_trace || log_content {
+            if should_trace || log_content || on_traced_path {
                 proxy_with_tracing_buffered(
                     state, collector, rebuilt, req_json,
                     &backend, log_content, app_name.to_string(),
@@ -356,15 +357,17 @@ async fn proxy_with_tracing_buffered(
         StatusCode::BAD_GATEWAY
     })?;
 
+    let metrics = state.metrics_collector.clone();
     if streaming {
-        handle_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
+        handle_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
     } else {
-        handle_non_streaming_response(collector, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
+        handle_non_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
     }
 }
 
 async fn handle_non_streaming_response(
     collector: Option<Arc<LangfuseCollector>>,
+    metrics: Arc<MetricsCollector>,
     resp: hyper::Response<hyper::body::Incoming>,
     req_json: Option<serde_json::Value>,
     app_name: String,
@@ -375,6 +378,7 @@ async fn handle_non_streaming_response(
     backend_name: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
+    let status_code = resp_parts.status.as_u16();
     let resp_bytes = resp_body
         .collect()
         .await
@@ -394,6 +398,9 @@ async fn handle_non_streaming_response(
         }
     }
 
+    // Save backend name before it is potentially moved into build_trace_event
+    let backend_for_metrics = backend_name.as_deref().unwrap_or("").to_string();
+
     if let Some(collector) = &collector {
         if let Some(event) = build_trace_event(
             &req_json,
@@ -410,6 +417,29 @@ async fn handle_non_streaming_response(
         }
     }
 
+    // Always record metrics
+    let latency_ms = (end_time - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+    let model = req_json.as_ref()
+        .and_then(|j| j.get("model").and_then(|v| v.as_str()))
+        .unwrap_or("unknown")
+        .to_string();
+    let (_, pt, ct, tps) = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+        .ok()
+        .map(|j| extract_output(&j, &path))
+        .unwrap_or_default();
+    metrics.record(MetricsRecord {
+        timestamp: start_time.to_rfc3339(),
+        backend_name: backend_for_metrics,
+        model,
+        endpoint: path,
+        prompt_tokens: pt,
+        completion_tokens: ct,
+        tokens_per_sec: tps,
+        ttft_ms: None,
+        latency_ms,
+        status_code,
+    });
+
     let body = Body::from(resp_bytes);
     let response = Response::from_parts(resp_parts, body);
     Ok(response)
@@ -417,6 +447,7 @@ async fn handle_non_streaming_response(
 
 async fn handle_streaming_response(
     collector: Option<Arc<LangfuseCollector>>,
+    metrics: Arc<MetricsCollector>,
     resp: hyper::Response<hyper::body::Incoming>,
     req_json: Option<serde_json::Value>,
     app_name: String,
@@ -427,6 +458,7 @@ async fn handle_streaming_response(
     backend_name: Option<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
+    let status_code = resp_parts.status.as_u16();
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -473,6 +505,13 @@ async fn handle_streaming_response(
             }
         }
 
+        // Save for metrics before backend_name is potentially moved
+        let backend_for_metrics = backend_name.as_deref().unwrap_or("").to_string();
+        let model_for_metrics = req_json.as_ref()
+            .and_then(|j| j.get("model").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+
         if let Some(collector) = collector {
             if let Some(event) = build_trace_event_from_stream(
                 &req_json,
@@ -489,6 +528,22 @@ async fn handle_streaming_response(
                 collector.send(event);
             }
         }
+
+        // Always record metrics
+        let latency_ms = (end_time - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+        let (pt, ct, tps) = extract_streaming_stats(&accumulated_bytes, &path);
+        metrics.record(MetricsRecord {
+            timestamp: start_time.to_rfc3339(),
+            backend_name: backend_for_metrics,
+            model: model_for_metrics,
+            endpoint: path,
+            prompt_tokens: pt,
+            completion_tokens: ct,
+            tokens_per_sec: tps,
+            ttft_ms,
+            latency_ms,
+            status_code,
+        });
     });
 
     let stream_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -692,6 +747,30 @@ fn extract_streaming_output_text(accumulated: &Bytes, path: &str) -> String {
         }
     }
     output
+}
+
+/// Extract token counts and tok/s from accumulated streaming bytes.
+fn extract_streaming_stats(accumulated: &Bytes, path: &str) -> (Option<u64>, Option<u64>, Option<f64>) {
+    let text = match std::str::from_utf8(accumulated) {
+        Ok(t) => t,
+        Err(_) => return (None, None, None),
+    };
+    let chunks = parse_streaming_chunks(text, path);
+    if path.starts_with("/v1/") {
+        let usage = chunks.iter().find_map(|c| c.get("usage"));
+        let pt = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+        let ct = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
+        (pt, ct, None)
+    } else {
+        let done = chunks.iter().find(|c| c.get("done").and_then(|d| d.as_bool()).unwrap_or(false));
+        let pt = done.and_then(|d| d.get("prompt_eval_count")).and_then(|v| v.as_u64());
+        let ct = done.and_then(|d| d.get("eval_count")).and_then(|v| v.as_u64());
+        let ns = done.and_then(|d| d.get("eval_duration")).and_then(|v| v.as_u64());
+        let tps = ct.zip(ns).and_then(|(t, n)| {
+            if n == 0 { None } else { Some(t as f64 / (n as f64 / 1_000_000_000.0)) }
+        });
+        (pt, ct, tps)
+    }
 }
 
 fn extract_input(req_body: &serde_json::Value, path: &str) -> serde_json::Value {

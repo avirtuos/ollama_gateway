@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::config::{BackendConfig, LangfuseConfig, ServerConfig};
 use crate::langfuse::LangfuseCollector;
+use crate::metrics::MetricsCollector;
 use crate::registry::ModelRegistry;
 
 pub struct AppState {
@@ -20,6 +21,7 @@ pub struct AppState {
     /// Inner `Arc<ModelRegistry>` so readers can clone cheaply without holding the lock.
     pub model_registry: Arc<RwLock<Arc<ModelRegistry>>>,
     pub privacy_mode: Arc<RwLock<bool>>,
+    pub metrics_collector: Arc<MetricsCollector>,
     pub http_client: Client<HttpConnector, Body>,
     pub server_config: ServerConfig,
     pub config_write_lock: Mutex<()>,
