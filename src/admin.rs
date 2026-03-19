@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{StatusCode, Uri, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -35,6 +35,9 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/api/backends/{name}", put(update_backend).delete(delete_backend))
         .route("/api/models", get(get_models))
         .route("/api/models/running", get(get_models_running))
+        .route("/api/metrics/backends", get(get_metrics_backends))
+        .route("/api/metrics/summary", get(get_metrics_summary))
+        .route("/api/metrics/timeseries", get(get_metrics_timeseries))
         .route("/api/chat", post(admin_chat))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -462,6 +465,31 @@ async fn admin_chat(
     *rebuilt.uri_mut() = new_uri;
 
     proxy_handler(State(state), rebuilt).await
+}
+
+// --- Metrics endpoints ---
+
+async fn get_metrics_backends(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let data = state.metrics_collector.query_backend_summary().await;
+    Json(serde_json::json!(data))
+}
+
+async fn get_metrics_summary(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let range = params.get("range").map(|s| s.as_str()).unwrap_or("24h");
+    Json(state.metrics_collector.query_summary(range).await)
+}
+
+async fn get_metrics_timeseries(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let range = params.get("range").map(|s| s.as_str()).unwrap_or("24h");
+    let backend = params.get("backend").filter(|s| !s.is_empty()).cloned();
+    let data = state.metrics_collector.query_timeseries(range, backend).await;
+    Json(serde_json::json!(data))
 }
 
 async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {

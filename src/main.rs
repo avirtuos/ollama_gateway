@@ -4,6 +4,7 @@ mod config;
 mod connection_id;
 mod error;
 mod langfuse;
+mod metrics;
 mod ollama;
 mod proxy;
 mod registry;
@@ -22,6 +23,7 @@ use auth::auth_middleware;
 use config::Config;
 use connection_id::ConnectionIdLayer;
 use langfuse::LangfuseCollector;
+use metrics::MetricsCollector;
 use proxy::proxy_handler;
 use registry::ModelRegistry;
 use state::AppState;
@@ -80,6 +82,13 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Init metrics DB next to the config file
+    let db_path = cli.config.parent()
+        .map(|p| p.join("metrics.db"))
+        .unwrap_or_else(|| std::path::PathBuf::from("metrics.db"));
+    info!(path = %db_path.display(), "Metrics DB");
+    let metrics_collector = Arc::new(MetricsCollector::new(&db_path));
+
     let http_client = Client::builder(TokioExecutor::new()).build_http();
 
     // Build initial model registry
@@ -99,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         backends: Arc::new(RwLock::new(config.backends.clone())),
         model_registry: Arc::new(RwLock::new(initial_registry)),
         privacy_mode: Arc::new(RwLock::new(config.server.privacy_mode)),
+        metrics_collector,
         http_client: http_client.clone(),
         server_config: config.server.clone(),
         config_write_lock: Mutex::new(()),

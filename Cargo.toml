@@ -30,6 +30,7 @@ tokio-stream = "0.1"
 anyhow = "1"
 langfuse-ergonomic = "0.6"
 langfuse-client-base = "0.7"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
