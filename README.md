@@ -12,6 +12,12 @@ Ollama Gateway now also supports model aggregation so that you can use it to mak
   <img src="docs/images/model_aggregator.png" alt="Ollama Gateway Admin UI" width="800"/>
 </p>
 
+The admin UI includes a Metrics page that provides real-time visibility into API usage, including call counts, token throughput, latency, and per-backend breakdowns. Use it to monitor gateway health and identify performance bottlenecks at a glance.
+
+<p align="center">
+  <img src="docs/images/metrics.png" alt="Ollama Gateway Metrics" width="800"/>
+</p>
+
 
 ## Features
 
