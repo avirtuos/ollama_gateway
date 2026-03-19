@@ -193,7 +193,7 @@ impl MetricsCollector {
                     return vec![];
                 }
             };
-            let cols = "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), AVG(tokens_per_sec), AVG(latency_ms)";
+            let cols = "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), AVG(COALESCE(tokens_per_sec, completion_tokens / (latency_ms / 1000.0))), AVG(latency_ms)";
             if let Some(ref backend) = backend_filter {
                 let sql = format!(
                     "SELECT {bucket_sql} as bucket, {cols} \

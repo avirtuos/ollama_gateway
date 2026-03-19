@@ -231,6 +231,9 @@
         <select id="metrics-backend" onchange="loadMetrics()">
           <option value="">All Backends</option>
         </select>
+        <label style="margin-left:1rem;display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
+          <input type="checkbox" id="metrics-autorefresh" checked onchange="showTab('metrics')"> Auto-refresh (30s)
+        </label>
       </div>
       <div class="metrics-cards">
         <div class="metric-card"><div class="metric-value" id="m-total-calls">-</div><div class="metric-label">Total Calls</div></div>
@@ -304,6 +307,16 @@
 <script>
   let password = null;
   let editingBackendName = null; // null = adding, string = editing
+  let metricsInterval = null;
+
+  function getPasswordCookie() {
+    const match = document.cookie.split('; ').find(c => c.startsWith('admin_password='));
+    return match ? decodeURIComponent(match.split('=')[1]) : null;
+  }
+
+  function setPasswordCookie(pw) {
+    document.cookie = 'admin_password=' + encodeURIComponent(pw) + '; max-age=14400; SameSite=Strict; path=/admin';
+  }
 
   function authHeader() {
     return 'Basic ' + btoa('admin:' + (password || ''));
@@ -328,6 +341,7 @@
       opts.headers['Authorization'] = authHeader();
       resp = await fetch(url, opts);
     }
+    if (resp.ok) setPasswordCookie(password);
     return resp;
   }
 
@@ -336,9 +350,16 @@
       document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
       document.querySelector(`.tab[data-tab="${t}"]`).classList.toggle('active', t === name);
     });
+    clearInterval(metricsInterval);
+    metricsInterval = null;
     if (name === 'backends') loadBackends();
     if (name === 'chat') loadModels();
-    if (name === 'metrics') loadMetrics();
+    if (name === 'metrics') {
+      loadMetrics();
+      if (document.getElementById('metrics-autorefresh').checked) {
+        metricsInterval = setInterval(loadMetrics, 30000);
+      }
+    }
   }
 
   // --- Settings ---
@@ -753,7 +774,7 @@
 
   // Initial load
   (async () => {
-    password = prompt('Enter admin password:') ?? '';
+    password = getPasswordCookie() ?? prompt('Enter admin password:') ?? '';
     await Promise.all([loadConfig(), loadLangfuse(), loadTokens()]);
   })();
 </script>
