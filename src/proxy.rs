@@ -899,7 +899,7 @@ pub fn build_upstream_request(
         .method(parts.method)
         .uri(uri);
 
-    let skip = ["host", "connection", "transfer-encoding", "authorization", "origin", "referer"];
+    let skip = ["host", "connection", "transfer-encoding", "authorization", "origin", "referer", "content-length"];
     for (name, value) in &parts.headers {
         if !skip.contains(&name.as_str()) {
             builder = builder.header(name, value);
