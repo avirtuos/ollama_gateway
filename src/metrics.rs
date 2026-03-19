@@ -151,7 +151,7 @@ impl MetricsCollector {
                 "SELECT COUNT(*),
                         COALESCE(SUM(prompt_tokens), 0),
                         COALESCE(SUM(completion_tokens), 0),
-                        AVG(tokens_per_sec),
+                        AVG(COALESCE(tokens_per_sec, completion_tokens / (latency_ms / 1000.0))),
                         AVG(latency_ms)
                  FROM api_calls WHERE timestamp >= ?1",
                 params![since],
