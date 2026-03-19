@@ -2,10 +2,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use chrono::{Duration, Utc};
+use chrono::{TimeDelta, Utc};
 use rusqlite::{params, Connection};
 use serde_json::json;
-use tracing::error;
+use tracing::{error, info, warn};
 
 pub struct MetricsRecord {
     pub timestamp: String,
@@ -21,7 +21,7 @@ pub struct MetricsRecord {
 }
 
 pub struct MetricsCollector {
-    tx: std::sync::mpsc::Sender<MetricsRecord>,
+    tx: std::sync::mpsc::SyncSender<MetricsRecord>,
     reader: Arc<Mutex<Connection>>,
 }
 
@@ -45,6 +45,10 @@ CREATE INDEX IF NOT EXISTS idx_api_calls_timestamp ON api_calls(timestamp);
 CREATE INDEX IF NOT EXISTS idx_api_calls_backend ON api_calls(backend);
 ";
 
+const MAX_BATCH_SIZE: usize = 500;
+const RETENTION_DAYS: i64 = 90;
+const PRUNE_EVERY_N_BATCHES: u64 = 100;
+
 impl MetricsCollector {
     pub fn new(db_path: &Path) -> Self {
         // Reader connection (also initialises schema)
@@ -52,7 +56,7 @@ impl MetricsCollector {
         reader_conn.execute_batch(SCHEMA).expect("Failed to create metrics schema");
         let reader = Arc::new(Mutex::new(reader_conn));
 
-        let (tx, rx) = std::sync::mpsc::channel::<MetricsRecord>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<MetricsRecord>(10_000);
 
         // Dedicated writer thread — owns its own connection
         let db_path_owned = db_path.to_path_buf();
@@ -78,14 +82,24 @@ impl MetricsCollector {
     }
 
     pub fn record(&self, record: MetricsRecord) {
-        // Fire-and-forget; ignore send errors (channel closed on shutdown)
-        let _ = self.tx.send(record);
+        use std::sync::mpsc::TrySendError;
+        match self.tx.try_send(record) {
+            Ok(_) => {}
+            Err(TrySendError::Full(_)) => warn!("Metrics channel full; dropping record"),
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 
     pub async fn query_backend_summary(&self) -> Vec<serde_json::Value> {
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = reader.lock().unwrap();
+            let conn = match reader.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Metrics reader mutex poisoned: {}", e);
+                    return vec![];
+                }
+            };
             let mut stmt = match conn.prepare(
                 "SELECT backend,
                         COUNT(*) as calls,
@@ -122,7 +136,17 @@ impl MetricsCollector {
         let since = range_to_since(range);
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = reader.lock().unwrap();
+            let conn = match reader.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Metrics reader mutex poisoned: {}", e);
+                    return json!({
+                        "total_calls": 0,
+                        "total_prompt_tokens": 0,
+                        "total_completion_tokens": 0,
+                    });
+                }
+            };
             conn.query_row(
                 "SELECT COUNT(*),
                         COALESCE(SUM(prompt_tokens), 0),
@@ -162,7 +186,13 @@ impl MetricsCollector {
         let bucket_sql = range_to_bucket_sql(range).to_string();
         let reader = self.reader.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = reader.lock().unwrap();
+            let conn = match reader.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Metrics reader mutex poisoned: {}", e);
+                    return vec![];
+                }
+            };
             let cols = "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), AVG(tokens_per_sec), AVG(latency_ms)";
             if let Some(ref backend) = backend_filter {
                 let sql = format!(
@@ -212,11 +242,11 @@ fn row_to_ts_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value
 
 fn range_to_since(range: &str) -> String {
     let dur = match range {
-        "1h"  => Duration::hours(1),
-        "6h"  => Duration::hours(6),
-        "7d"  => Duration::days(7),
-        "30d" => Duration::days(30),
-        _     => Duration::hours(24),
+        "1h"  => TimeDelta::hours(1),
+        "6h"  => TimeDelta::hours(6),
+        "7d"  => TimeDelta::days(7),
+        "30d" => TimeDelta::days(30),
+        _     => TimeDelta::hours(24),
     };
     (Utc::now() - dur).to_rfc3339()
 }
@@ -232,14 +262,34 @@ fn range_to_bucket_sql(range: &str) -> &'static str {
 }
 
 fn writer_loop(mut conn: Connection, rx: std::sync::mpsc::Receiver<MetricsRecord>) {
+    let mut batch_count: u64 = 0;
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
-        while let Ok(record) = rx.try_recv() {
-            batch.push(record);
+        while batch.len() < MAX_BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(record) => batch.push(record),
+                Err(_) => break,
+            }
         }
         if let Err(e) = insert_batch(&mut conn, &batch) {
             error!("Failed to insert metrics batch (size={}): {}", batch.len(), e);
         }
+        batch_count += 1;
+        if batch_count % PRUNE_EVERY_N_BATCHES == 0 {
+            prune_old_records(&conn);
+        }
+    }
+}
+
+fn prune_old_records(conn: &Connection) {
+    let cutoff = (Utc::now() - TimeDelta::days(RETENTION_DAYS)).to_rfc3339();
+    match conn.execute("DELETE FROM api_calls WHERE timestamp < ?1", params![cutoff]) {
+        Ok(n) => {
+            if n > 0 {
+                info!("Pruned {} metrics records older than {} days", n, RETENTION_DAYS);
+            }
+        }
+        Err(e) => error!("Failed to prune old metrics records: {}", e),
     }
 }
 

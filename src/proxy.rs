@@ -163,18 +163,17 @@ async fn dispatch(
 
             let collector = state.langfuse_collector.read().await.clone();
             let on_traced_path = TRACED_PATHS.iter().any(|p| path == *p || path.starts_with(p));
-            let should_trace = collector.is_some() && on_traced_path;
             let log_content = !privacy_mode && on_traced_path;
 
             let rebuilt = Request::from_parts(parts, Body::from(req_bytes));
-            if should_trace || log_content || on_traced_path {
+            if on_traced_path {
                 proxy_with_tracing_buffered(
                     state, collector, rebuilt, req_json,
                     &backend, log_content, app_name.to_string(),
                     Some(session_id.to_string()),
                 ).await
             } else {
-                proxy_single(&state.http_client, rebuilt, &backend.url).await
+                proxy_single_with_metrics(state, rebuilt, &backend, path).await
             }
         }
 
@@ -186,26 +185,45 @@ async fn dispatch(
                     return Err(StatusCode::BAD_GATEWAY);
                 }
             };
-            proxy_single(&state.http_client, req, &backend.url).await
+            proxy_single_with_metrics(state, req, &backend, path).await
         }
     }
 }
 
-/// Route a single request to one upstream backend.
-async fn proxy_single(
-    http_client: &hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
+/// Route a single request and record latency/status metrics (no token data).
+async fn proxy_single_with_metrics(
+    state: Arc<AppState>,
     req: Request<Body>,
-    upstream_url: &str,
+    backend: &BackendConfig,
+    path: &str,
 ) -> Result<Response<Body>, StatusCode> {
-    let upstream_req = build_upstream_request(upstream_url, req).map_err(|e| {
+    let start_time = Utc::now();
+    let upstream_req = build_upstream_request(&backend.url, req).map_err(|e| {
         error!("Failed to build upstream request: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
 
-    let resp = http_client.request(upstream_req).await.map_err(|e| {
+    let resp = state.http_client.request(upstream_req).await.map_err(|e| {
         error!("Upstream request failed: {}", e);
         StatusCode::BAD_GATEWAY
     })?;
+
+    let end_time = Utc::now();
+    let status_code = resp.status().as_u16();
+    let latency_ms = (end_time - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+
+    state.metrics_collector.record(MetricsRecord {
+        timestamp: start_time.to_rfc3339(),
+        backend_name: backend.name.clone(),
+        model: String::new(),
+        endpoint: path.to_string(),
+        prompt_tokens: None,
+        completion_tokens: None,
+        tokens_per_sec: None,
+        ttft_ms: None,
+        latency_ms,
+        status_code,
+    });
 
     Ok(convert_response(resp))
 }
