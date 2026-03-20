@@ -444,6 +444,7 @@ async fn handle_non_streaming_response(
             end_time,
             session_id,
             backend_name,
+            log_content,
         ) {
             debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, "queuing trace event");
             collector.send(event);
@@ -556,6 +557,7 @@ async fn handle_streaming_response(
                 session_id,
                 ttft_ms,
                 backend_name,
+                log_content,
             ) {
                 debug!(model = %event.model, endpoint = %event.endpoint, app_name = %event.app_name, session_id = ?event.session_id, tokens_per_sec = ?event.tokens_per_sec, ttft_ms = ?event.ttft_ms, "queuing trace event");
                 collector.send(event);
@@ -594,6 +596,7 @@ fn build_trace_event(
     end_time: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
     backend_name: Option<String>,
+    log_content: bool,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
     let resp_json: serde_json::Value = serde_json::from_slice(resp_bytes).ok()?;
@@ -604,8 +607,14 @@ fn build_trace_event(
         .unwrap_or("unknown")
         .to_string();
 
-    let input = extract_input(req_body, path);
-    let (output, prompt_tokens, completion_tokens, tokens_per_sec) = extract_output(&resp_json, path);
+    let (input, output) = if log_content {
+        let input = extract_input(req_body, path);
+        let (output, ..) = extract_output(&resp_json, path);
+        (input, output)
+    } else {
+        (serde_json::json!("[redacted]"), serde_json::json!("[redacted]"))
+    };
+    let (_, prompt_tokens, completion_tokens, tokens_per_sec) = extract_output(&resp_json, path);
 
     Some(LangfuseEvent {
         trace_id: Uuid::new_v4().to_string(),
@@ -637,6 +646,7 @@ fn build_trace_event_from_stream(
     session_id: Option<String>,
     ttft_ms: Option<f64>,
     backend_name: Option<String>,
+    log_content: bool,
 ) -> Option<LangfuseEvent> {
     let req_body = req_json.as_ref()?;
 
@@ -646,7 +656,7 @@ fn build_trace_event_from_stream(
         .unwrap_or("unknown")
         .to_string();
 
-    let input = extract_input(req_body, path);
+    let input = if log_content { extract_input(req_body, path) } else { serde_json::json!("[redacted]") };
 
     let text = std::str::from_utf8(accumulated).ok()?;
     let chunks = parse_streaming_chunks(text, path);
@@ -712,7 +722,7 @@ fn build_trace_event_from_stream(
         model,
         endpoint: path.to_string(),
         input,
-        output: serde_json::Value::String(output_text),
+        output: if log_content { serde_json::Value::String(output_text) } else { serde_json::json!("[redacted]") },
         start_time,
         end_time,
         prompt_tokens,
