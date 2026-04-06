@@ -73,20 +73,26 @@ impl Processor for Gemma4ToolCallFix {
     }
 }
 
-/// Clean a single message object (assistant message with tool_calls).
+/// Clean tool_calls in an assistant message.
+///
+/// Only touches messages with `role: assistant` to avoid mangling system
+/// prompts, user messages, or tool results.  Only modifies the `tool_calls`
+/// array — the `content` field is left untouched since it is free-form text
+/// that may legitimately contain `<|` sequences (e.g. XML-style tags).
 fn sanitize_message(msg: &mut Value) {
+    // Only process assistant messages
+    let is_assistant = msg
+        .get("role")
+        .and_then(|r| r.as_str())
+        .map(|r| r == "assistant")
+        .unwrap_or(false);
+    if !is_assistant {
+        return;
+    }
+
     if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
         for tc in tool_calls.iter_mut() {
             sanitize_tool_call(tc);
-        }
-    }
-    // Also clean content if it contains leaked tool-call delimiters
-    if let Some(content) = msg.get_mut("content").and_then(|c| c.as_str()).map(|s| s.to_string()) {
-        if content.contains("<|") || content.contains("|>") {
-            let cleaned = sanitize_string(&content);
-            if cleaned != content {
-                *msg.get_mut("content").unwrap() = Value::String(cleaned);
-            }
         }
     }
 }
@@ -202,19 +208,6 @@ fn sanitize_tool_call_arguments(raw: &str) -> String {
     s
 }
 
-/// Clean leaked special tokens from arbitrary string content.
-fn sanitize_string(raw: &str) -> String {
-    let mut s = raw.to_string();
-    s = s.replace("<|tool_call>", "");
-    s = s.replace("<tool_call|>", "");
-    s = s.replace("<|tool_call|>", "");
-    s = s.replace("<|\"|>", "\"");
-    s = s.replace("<|\\\"", "\"");
-    s = s.replace("<|\"", "\"");
-    s = s.replace("\"|>", "\"");
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +298,35 @@ mod tests {
         assert!(serde_json::from_str::<Value>(args).is_ok(), "Args not valid JSON: {}", args);
         let parsed: Value = serde_json::from_str(args).unwrap();
         assert_eq!(parsed["text"], "hello");
+    }
+
+    #[test]
+    fn test_non_assistant_messages_untouched() {
+        // System and user messages should never be modified, even if they
+        // contain sequences that look like Gemma 4 tokens.
+        let mut system_msg = serde_json::json!({
+            "role": "system",
+            "content": "Use <|special|> tags and <available_skills> here"
+        });
+        let original = system_msg.clone();
+        sanitize_message(&mut system_msg);
+        assert_eq!(system_msg, original, "System message was modified");
+
+        let mut user_msg = serde_json::json!({
+            "role": "user",
+            "content": "Check <|tool_call> tokens"
+        });
+        let original = user_msg.clone();
+        sanitize_message(&mut user_msg);
+        assert_eq!(user_msg, original, "User message was modified");
+
+        let mut tool_msg = serde_json::json!({
+            "role": "tool",
+            "content": "Error: Invalid <|\\escape",
+            "tool_call_id": "123"
+        });
+        let original = tool_msg.clone();
+        sanitize_message(&mut tool_msg);
+        assert_eq!(tool_msg, original, "Tool message was modified");
     }
 }
