@@ -109,6 +109,7 @@
     <button class="tab active" data-tab="settings" onclick="showTab('settings')">Settings</button>
     <button class="tab" data-tab="backends" onclick="showTab('backends')">Backends</button>
     <button class="tab" data-tab="tokens" onclick="showTab('tokens')">Tokens</button>
+    <button class="tab" data-tab="processors" onclick="showTab('processors')">Processors</button>
     <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
     <button class="tab" data-tab="metrics" onclick="showTab('metrics')">Metrics</button>
   </nav>
@@ -217,6 +218,41 @@
     </section>
   </div>
 
+  <!-- Processors Tab -->
+  <div id="tab-processors" style="display:none">
+    <section>
+      <h2>Available Processors</h2>
+      <p style="font-size:.85rem;color:#6b7280;margin-bottom:1rem;">Built-in request/response processors that can fix model-specific issues.</p>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Description</th><th>Phase</th></tr>
+        </thead>
+        <tbody id="processors-body"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Processor Rules</h2>
+      <p style="font-size:.85rem;color:#6b7280;margin-bottom:1rem;">
+        Assign processors to specific model/backend combinations. Use <code>*</code> as a wildcard in model patterns (e.g. <code>*gemma*</code>). Leave backend empty to match all backends.
+      </p>
+      <table id="rules-table">
+        <thead>
+          <tr>
+            <th>Model Pattern</th>
+            <th>Backend</th>
+            <th>Preprocessors</th>
+            <th>Postprocessors</th>
+            <th style="width:140px"></th>
+          </tr>
+        </thead>
+        <tbody id="rules-body"></tbody>
+      </table>
+      <div class="btn-row">
+        <button class="btn btn-success" onclick="openRuleModal()">Add Rule</button>
+      </div>
+    </section>
+  </div>
+
   <!-- Metrics Tab -->
   <div id="tab-metrics" style="display:none">
     <section>
@@ -305,6 +341,35 @@
   </div>
 </div>
 
+<!-- Processor Rule Add/Edit Modal -->
+<div class="modal-backdrop" id="rule-modal">
+  <div class="modal">
+    <h3 id="rule-modal-title">Add Processor Rule</h3>
+    <div class="form-grid">
+      <div class="form-group">
+        <label for="rule-model">Model Pattern (glob, e.g. *gemma*)</label>
+        <input type="text" id="rule-model" placeholder="*gemma*">
+      </div>
+      <div class="form-group">
+        <label for="rule-backend">Backend Name (empty = all)</label>
+        <input type="text" id="rule-backend" placeholder="">
+      </div>
+      <div class="form-group full">
+        <label for="rule-pre">Preprocessors (comma-separated IDs)</label>
+        <input type="text" id="rule-pre" placeholder="gemma4-tool-call-fix">
+      </div>
+      <div class="form-group full">
+        <label for="rule-post">Postprocessors (comma-separated IDs)</label>
+        <input type="text" id="rule-post" placeholder="gemma4-tool-call-fix">
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="saveRule()">Save</button>
+      <button class="btn btn-secondary" onclick="closeRuleModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div id="status-bar"></div>
 
 <script>
@@ -349,13 +414,14 @@
   }
 
   function showTab(name) {
-    ['settings', 'backends', 'tokens', 'chat', 'metrics'].forEach(t => {
+    ['settings', 'backends', 'tokens', 'processors', 'chat', 'metrics'].forEach(t => {
       document.getElementById('tab-' + t).style.display = t === name ? '' : 'none';
       document.querySelector(`.tab[data-tab="${t}"]`).classList.toggle('active', t === name);
     });
     clearInterval(metricsInterval);
     metricsInterval = null;
     if (name === 'backends') loadBackends();
+    if (name === 'processors') loadProcessors();
     if (name === 'chat') loadModels();
     if (name === 'metrics') {
       loadMetrics();
@@ -504,6 +570,111 @@
     if (resp.ok) { showStatus('Registry refresh triggered'); setTimeout(loadBackends, 2000); }
     else         { showStatus('Failed to trigger refresh', false); }
   }
+
+  // --- Processors ---
+
+  let availableProcessors = [];
+  let editingRuleIndex = null; // null = adding, number = editing
+
+  async function loadProcessors() {
+    const [procResp, rulesResp] = await Promise.all([
+      apiFetch('/api/processors'),
+      apiFetch('/api/processor-rules'),
+    ]);
+
+    // Available processors table
+    if (procResp.ok) {
+      availableProcessors = await procResp.json();
+      const tbody = document.getElementById('processors-body');
+      if (!availableProcessors.length) {
+        tbody.innerHTML = '<tr><td colspan="3" class="empty-msg">No processors available</td></tr>';
+      } else {
+        tbody.innerHTML = availableProcessors.map(p => `
+          <tr>
+            <td><code>${esc(p.id)}</code></td>
+            <td style="white-space:normal;font-family:system-ui;font-size:.85rem;">${esc(p.description)}</td>
+            <td><span class="badge ${p.phase === 'both' ? 'badge-green' : 'badge-green'}" style="background:#e0e7ff;color:#3730a3;">${esc(p.phase)}</span></td>
+          </tr>
+        `).join('');
+      }
+    }
+
+    // Rules table
+    if (rulesResp.ok) {
+      const rules = await rulesResp.json();
+      const tbody = document.getElementById('rules-body');
+      if (!rules.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">No processor rules configured. Add a rule to assign processors to models.</td></tr>';
+      } else {
+        tbody.innerHTML = rules.map((r, i) => `
+          <tr>
+            <td><code>${esc(r.model_pattern)}</code></td>
+            <td>${r.backend_name ? esc(r.backend_name) : '<span style="color:#9ca3af">all</span>'}</td>
+            <td>${(r.preprocessors || []).map(p => '<code>' + esc(p) + '</code>').join(', ') || '<span style="color:#9ca3af">none</span>'}</td>
+            <td>${(r.postprocessors || []).map(p => '<code>' + esc(p) + '</code>').join(', ') || '<span style="color:#9ca3af">none</span>'}</td>
+            <td>
+              <button class="btn btn-primary" style="padding:.3rem .6rem;font-size:.78rem" onclick="openRuleModal(${i}, ${esc(JSON.stringify(r))})">Edit</button>
+              <button class="btn btn-danger" style="padding:.3rem .6rem;font-size:.78rem" onclick="removeRule(${i})">Delete</button>
+            </td>
+          </tr>
+        `).join('');
+      }
+    }
+  }
+
+  function openRuleModal(index, existing) {
+    editingRuleIndex = index != null && existing ? index : null;
+    document.getElementById('rule-modal-title').textContent = existing ? 'Edit Processor Rule' : 'Add Processor Rule';
+    document.getElementById('rule-model').value   = existing ? existing.model_pattern : '';
+    document.getElementById('rule-backend').value  = existing ? existing.backend_name : '';
+    document.getElementById('rule-pre').value      = existing ? (existing.preprocessors || []).join(', ') : '';
+    document.getElementById('rule-post').value     = existing ? (existing.postprocessors || []).join(', ') : '';
+    document.getElementById('rule-modal').classList.add('open');
+  }
+
+  function closeRuleModal() {
+    document.getElementById('rule-modal').classList.remove('open');
+    editingRuleIndex = null;
+  }
+
+  async function saveRule() {
+    const body = {
+      model_pattern:  document.getElementById('rule-model').value.trim(),
+      backend_name:   document.getElementById('rule-backend').value.trim(),
+      preprocessors:  document.getElementById('rule-pre').value.split(',').map(s => s.trim()).filter(Boolean),
+      postprocessors: document.getElementById('rule-post').value.split(',').map(s => s.trim()).filter(Boolean),
+    };
+    if (!body.model_pattern) { showStatus('Model pattern is required', false); return; }
+    if (!body.preprocessors.length && !body.postprocessors.length) { showStatus('At least one processor is required', false); return; }
+
+    let resp;
+    if (editingRuleIndex != null) {
+      resp = await apiFetch('/api/processor-rules/' + editingRuleIndex, { method: 'PUT', body: JSON.stringify(body) });
+    } else {
+      resp = await apiFetch('/api/processor-rules', { method: 'POST', body: JSON.stringify(body) });
+    }
+
+    if (resp.ok) {
+      showStatus(editingRuleIndex != null ? 'Rule updated' : 'Rule added');
+      closeRuleModal();
+      loadProcessors();
+    } else {
+      const err = await resp.json().catch(() => ({}));
+      showStatus(err.error || 'Failed to save rule', false);
+    }
+  }
+
+  async function removeRule(index) {
+    if (!confirm('Delete this processor rule?')) return;
+    const resp = await apiFetch('/api/processor-rules/' + index, { method: 'DELETE' });
+    if (resp.ok) { showStatus('Rule deleted'); loadProcessors(); }
+    else         { showStatus('Failed to delete rule', false); }
+  }
+
+  // Close rule modal on backdrop click
+  document.getElementById('rule-modal').addEventListener('click', function(e) {
+    if (e.target === this) closeRuleModal();
+  });
 
   // --- Tokens ---
 
