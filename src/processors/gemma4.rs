@@ -151,13 +151,39 @@ fn sanitize_tool_call_arguments(raw: &str) -> String {
     // `|"` at start of a value → `"` (opening quote)
     s = s.replace("|\"", "\"");
 
-    // Fix doubled quotes that may result from the above replacements
-    // e.g. `""value""` → `"value"`
-    while s.contains("\"\"\"") {
-        s = s.replace("\"\"\"", "\"");
+    // Fix doubled quotes that may result from the above replacements.
+    // After stripping Gemma tokens, we can end up with patterns like:
+    //   "value""  (token was a closing delimiter that left an extra quote)
+    //   ""value"  (token was an opening delimiter that left an extra quote)
+    // Strategy: collapse any run of 2+ quotes into a single quote, EXCEPT
+    // when it's an intentional empty string like `"key": ""` (quote-quote
+    // preceded by `: ` or `:`).
+    loop {
+        // First collapse triple+ quotes
+        if s.contains("\"\"\"") {
+            s = s.replace("\"\"\"", "\"");
+            continue;
+        }
+        // Then fix doubled quotes at value boundaries:
+        //   `"",` `""}` `""]` → keep as empty string (these are valid)
+        //   `"": ` → keep as empty key (valid)
+        //   All other `""` → collapse to single `"`
+        // We do this by checking what follows/precedes the `""`
+        if let Some(pos) = s.find("\"\"") {
+            let after = s.get(pos + 2..pos + 3).unwrap_or("");
+            let before = if pos > 0 { s.get(pos - 1..pos).unwrap_or("") } else { "" };
+            // Keep `""` if it looks like an empty string value: after `:` and before `,` `}` `]`
+            let is_empty_string = (before == ":" || before == " ")
+                && (after == "," || after == "}" || after == "]" || after.is_empty());
+            if is_empty_string {
+                break; // Legit empty string, stop collapsing
+            }
+            // Otherwise collapse this `""` to `"`
+            s = format!("{}\"{}", &s[..pos], &s[pos + 2..]);
+            continue;
+        }
+        break;
     }
-    // Also fix `""` at value positions (empty double-quotes from over-stripping)
-    // but preserve intentional empty strings like `"key": ""`
 
     // If the result is valid JSON, return it. Otherwise try to repair common issues.
     if serde_json::from_str::<Value>(&s).is_ok() {
@@ -192,6 +218,33 @@ fn sanitize_string(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clean_real_hermes_payload() {
+        // Exact pattern from production: Hermes sends the Gemma 4 output as a JSON
+        // string where `<|\"` is `<|\` after JSON unescaping.
+        // The raw JSON string (before JSON parsing) looks like:
+        //   "<|\\Setup working directory<|\\\"|\""
+        // After JSON string unescaping, the Rust string is:
+        //   <|\Setup working directory<|\"|"
+        // But our processor sees the arguments as a String value already parsed by serde,
+        // so we test with what serde gives us.
+        let raw = r#"{"todos": [{"content": "<|\"Setup working directory<|\"|", "id": "<|\"setup<|\"|", "status": "<|\"in_progress<|\""}]}"#;
+        // After JSON unescaping of the outer string, the inner content is:
+        // <|"Setup working directory<|"|
+        // which should clean to: Setup working directory
+        let cleaned = sanitize_tool_call_arguments(raw);
+        assert!(serde_json::from_str::<Value>(&cleaned).is_ok(), "Result was not valid JSON: {}", cleaned);
+    }
+
+    #[test]
+    fn test_clean_backslash_pipe_pattern() {
+        // Pattern from the actual gateway logs: <|\value<|\"|
+        // In a JSON string context, the backslash is escaped, so the Rust string has literal <|\
+        let raw = r#"{"content": "<|\hello<|\"|", "id": "<|\test<|\"|"}"#;
+        let cleaned = sanitize_tool_call_arguments(raw);
+        assert!(serde_json::from_str::<Value>(&cleaned).is_ok(), "Result was not valid JSON: {}", cleaned);
+    }
 
     #[test]
     fn test_clean_gemma4_pipe_delimiters() {
