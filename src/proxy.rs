@@ -197,6 +197,18 @@ async fn dispatch(
                 req_bytes
             };
 
+            // Debug: log full request body including tools array
+            if let Some(ref json) = req_json {
+                let has_tools = json.get("tools").and_then(|t| t.as_array()).map(|a| a.len());
+                debug!(
+                    model = model_str,
+                    backend = %backend.name,
+                    has_tools = ?has_tools,
+                    body = %json,
+                    "Full request body"
+                );
+            }
+
             let collector = state.langfuse_collector.read().await.clone();
             let on_traced_path = TRACED_PATHS.iter().any(|p| path == *p || path.starts_with(p));
             let log_content = !privacy_mode && on_traced_path;
@@ -481,6 +493,16 @@ async fn handle_non_streaming_response(
 
     let end_time = Utc::now();
 
+    // Debug: log full response body including tool_calls
+    if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+        debug!(
+            endpoint = %path,
+            status = status_code,
+            body = %resp_json,
+            "Full response body"
+        );
+    }
+
     if log_content {
         if let Some(req_body) = &req_json {
             if let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
@@ -602,6 +624,16 @@ async fn handle_streaming_response(
         let ttft_ms = first_chunk_time
             .map(|t| (t - start_time).num_microseconds().unwrap_or(0) as f64 / 1000.0);
         let accumulated_bytes = Bytes::from(accumulated);
+
+        // Debug: log full accumulated streaming response
+        if let Ok(text) = std::str::from_utf8(&accumulated_bytes) {
+            debug!(
+                endpoint = %path,
+                status = status_code,
+                body = %text,
+                "Full streaming response (accumulated)"
+            );
+        }
 
         if log_content {
             if let Some(req_body) = &req_json {
