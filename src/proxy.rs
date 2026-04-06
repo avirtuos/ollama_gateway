@@ -291,13 +291,31 @@ async fn apply_postprocessors_to_response(
     let (parts, body) = resp.into_parts();
     let resp_bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
 
-    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-        registry.apply_postprocessors(post_ids, &mut json);
-        let new_bytes = serde_json::to_vec(&json).unwrap_or_else(|_| resp_bytes.to_vec());
-        Ok(Response::from_parts(parts, Body::from(new_bytes)))
-    } else {
-        Ok(Response::from_parts(parts, Body::from(resp_bytes)))
-    }
+    let parse_result = serde_json::from_slice::<serde_json::Value>(&resp_bytes);
+
+    // If JSON parsing fails, try raw-text repair (e.g. stripping Gemma 4
+    // special tokens that break JSON structure) then re-parse.
+    let mut json = match parse_result {
+        Ok(v) => v,
+        Err(_) => {
+            let raw_str = String::from_utf8_lossy(&resp_bytes);
+            if let Some(repaired) = registry.try_repair_raw(post_ids, &raw_str) {
+                match serde_json::from_str::<serde_json::Value>(&repaired) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!("Postprocessor raw repair produced non-JSON, passing through");
+                        return Ok(Response::from_parts(parts, Body::from(resp_bytes)));
+                    }
+                }
+            } else {
+                return Ok(Response::from_parts(parts, Body::from(resp_bytes)));
+            }
+        }
+    };
+
+    registry.apply_postprocessors(post_ids, &mut json);
+    let new_bytes = serde_json::to_vec(&json).unwrap_or_else(|_| resp_bytes.to_vec());
+    Ok(Response::from_parts(parts, Body::from(new_bytes)))
 }
 
 /// Fan out to all healthy backends, aggregate their model lists.
@@ -481,11 +499,27 @@ async fn handle_non_streaming_response(
 
     // Apply postprocessors to the buffered response
     let resp_bytes = if !post_ids.is_empty() {
-        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-            proc_registry.apply_postprocessors(&post_ids, &mut json);
-            serde_json::to_vec(&json).map(bytes::Bytes::from).unwrap_or(resp_bytes)
-        } else {
-            resp_bytes
+        let parse_result = serde_json::from_slice::<serde_json::Value>(&resp_bytes);
+        match parse_result {
+            Ok(mut json) => {
+                proc_registry.apply_postprocessors(&post_ids, &mut json);
+                serde_json::to_vec(&json).map(bytes::Bytes::from).unwrap_or(resp_bytes)
+            }
+            Err(_) => {
+                // JSON parse failed — try raw-text repair then re-parse
+                let raw_str = String::from_utf8_lossy(&resp_bytes);
+                if let Some(repaired) = proc_registry.try_repair_raw(&post_ids, &raw_str) {
+                    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                        proc_registry.apply_postprocessors(&post_ids, &mut json);
+                        serde_json::to_vec(&json).map(bytes::Bytes::from).unwrap_or(resp_bytes)
+                    } else {
+                        warn!("Postprocessor raw repair produced non-JSON, passing through");
+                        resp_bytes
+                    }
+                } else {
+                    resp_bytes
+                }
+            }
         }
     } else {
         resp_bytes

@@ -71,6 +71,10 @@ impl Processor for Gemma4ToolCallFix {
             sanitize_message(msg);
         }
     }
+
+    fn repair_raw_response(&self, raw: &str) -> Option<String> {
+        repair_raw_body(raw)
+    }
 }
 
 /// Clean tool_calls in an assistant message.
@@ -114,6 +118,59 @@ fn sanitize_tool_call(tc: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Repair a raw response body whose JSON is broken by leaked Gemma 4 tokens.
+///
+/// When Gemma 4 emits `<|"|>` tokens inside the `arguments` string of a tool
+/// call, the unescaped `"` in the token breaks the outer JSON structure of the
+/// entire HTTP response body.  `serde_json::from_slice` then fails and the
+/// normal postprocessor pipeline (which operates on parsed `Value`) is skipped.
+///
+/// This function strips the known special-token patterns from the raw response
+/// text so that a subsequent JSON parse can succeed, after which the structured
+/// `process_response` postprocessor can clean up the argument values.
+///
+/// Because the tokens appear *inside* a JSON string literal (the `arguments`
+/// field value), replacements use `\"` (escaped quote) so the surrounding JSON
+/// remains valid.
+fn repair_raw_body(raw: &str) -> Option<String> {
+    // Quick bail-out: if there are no Gemma 4 token markers, nothing to do.
+    if !raw.contains("<|") && !raw.contains("|>") {
+        return None;
+    }
+
+    let mut s = raw.to_string();
+
+    // Strip block delimiters
+    s = s.replace("<|tool_call>", "");
+    s = s.replace("<tool_call|>", "");
+    s = s.replace("<|tool_call|>", "");
+
+    // Replace the full Gemma 4 string delimiter with an escaped quote that is
+    // safe inside a JSON string value.
+    s = s.replace("<|\"|>", "\\\"");
+
+    // Partial delimiter variants (Ollama / llama.cpp output)
+    s = s.replace("<|\\\"|", "\\\"");
+    s = s.replace("<|\\\"", "\\\"");
+    s = s.replace("<|\"", "\\\"");
+    s = s.replace("\"|>", "\\\"");
+
+    // Remaining bare markers
+    s = s.replace("<|\\", "");
+    s = s.replace("<|", "");
+    s = s.replace("|>", "");
+
+    // Stray pipe-quote combos
+    s = s.replace("\"|", "\\\"");
+    s = s.replace("|\"", "\\\"");
+
+    if s == raw {
+        return None;
+    }
+
+    Some(s)
 }
 
 /// Repair a tool-call arguments string that may contain Gemma 4 special tokens.
@@ -328,5 +385,34 @@ mod tests {
         let original = tool_msg.clone();
         sanitize_message(&mut tool_msg);
         assert_eq!(tool_msg, original, "Tool message was modified");
+    }
+
+    // ── repair_raw_body tests ────────────────────────────────────────
+
+    #[test]
+    fn test_repair_raw_body_valid_json_untouched() {
+        let valid = r#"{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        assert!(repair_raw_body(valid).is_none(), "Valid JSON should return None");
+    }
+
+    #[test]
+    fn test_repair_raw_body_gemma4_tokens_in_arguments() {
+        // Simulates what vLLM actually returns: the `arguments` string value
+        // contains <|"|> tokens with unescaped quotes that break the outer JSON.
+        let raw = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"function":{"name":"todo","arguments":"{\"text\": <|\"|>hello<|\"|>}"}}]}}]}"#;
+        let repaired = repair_raw_body(raw);
+        assert!(repaired.is_some(), "Should have repaired");
+        let repaired = repaired.unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&repaired).is_ok(),
+            "Repaired body not valid JSON: {}",
+            repaired
+        );
+    }
+
+    #[test]
+    fn test_repair_raw_body_no_markers_returns_none() {
+        let raw = r#"this is not json but has no gemma tokens"#;
+        assert!(repair_raw_body(raw).is_none());
     }
 }

@@ -26,6 +26,17 @@ pub trait Processor: Send + Sync {
 
     /// Transform a single streaming response chunk.
     fn process_response_chunk(&self, chunk: &mut Value);
+
+    /// Attempt to repair raw response text that is not valid JSON.
+    ///
+    /// Called when the response body fails JSON parsing.  Processors that know
+    /// about model-specific token leakage (e.g. Gemma 4 `<|"|>` delimiters)
+    /// can strip those tokens from the raw text so that a subsequent JSON parse
+    /// may succeed.  Returns `Some(repaired)` if the processor made changes,
+    /// `None` otherwise.
+    fn repair_raw_response(&self, _raw: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Serializable metadata about a built-in processor (for the admin API).
@@ -94,6 +105,26 @@ impl ProcessorRegistry {
                 }
             }
         }
+    }
+
+    /// Try to repair raw response text using matching postprocessors.
+    ///
+    /// Called when the response body is not valid JSON.  Each processor's
+    /// `repair_raw_response` is tried in order; the first `Some` result wins.
+    pub fn try_repair_raw(&self, ids: &[String], raw: &str) -> Option<String> {
+        for id in ids {
+            if let Some(p) = self.get(id) {
+                match p.phase() {
+                    ProcessorPhase::Post | ProcessorPhase::Both => {
+                        if let Some(repaired) = p.repair_raw_response(raw) {
+                            return Some(repaired);
+                        }
+                    }
+                    ProcessorPhase::Pre => {}
+                }
+            }
+        }
+        None
     }
 
     /// Apply all matching postprocessors to a streaming chunk.
