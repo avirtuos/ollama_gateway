@@ -1050,13 +1050,30 @@ fn process_streaming_chunk(
                     output.push_str(line);
                     continue;
                 }
-                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(payload) {
-                    registry.apply_chunk_postprocessors(post_ids, &mut json);
-                    output.push_str("data: ");
-                    output.push_str(&serde_json::to_string(&json).unwrap_or_else(|_| payload.to_string()));
-                    output.push('\n');
-                    continue;
-                }
+                let parsed = serde_json::from_str::<serde_json::Value>(payload);
+                let mut json = match parsed {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Chunk JSON broken — try raw repair (e.g. Gemma 4 token stripping)
+                        if let Some(repaired) = registry.try_repair_raw(post_ids, payload) {
+                            match serde_json::from_str::<serde_json::Value>(&repaired) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    output.push_str(line);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            output.push_str(line);
+                            continue;
+                        }
+                    }
+                };
+                registry.apply_chunk_postprocessors(post_ids, &mut json);
+                output.push_str("data: ");
+                output.push_str(&serde_json::to_string(&json).unwrap_or_else(|_| payload.to_string()));
+                output.push('\n');
+                continue;
             }
             output.push_str(line);
         } else {
@@ -1065,7 +1082,19 @@ fn process_streaming_chunk(
                 output.push_str(line);
                 continue;
             }
-            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let parsed = serde_json::from_str::<serde_json::Value>(trimmed);
+            let json_opt = match parsed {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    // Chunk JSON broken — try raw repair
+                    if let Some(repaired) = registry.try_repair_raw(post_ids, trimmed) {
+                        serde_json::from_str::<serde_json::Value>(&repaired).ok()
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(mut json) = json_opt {
                 registry.apply_chunk_postprocessors(post_ids, &mut json);
                 output.push_str(&serde_json::to_string(&json).unwrap_or_else(|_| trimmed.to_string()));
                 if line.ends_with('\n') {
