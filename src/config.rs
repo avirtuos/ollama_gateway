@@ -14,6 +14,24 @@ pub struct Config {
     #[serde(default)]
     pub tokens: Vec<TokenEntry>,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub processor_rules: Vec<ProcessorRule>,
+}
+
+/// A rule that assigns pre/post processors to a (model_pattern, backend) pair.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ProcessorRule {
+    /// Glob-style pattern matched against the model name (e.g. `"gemma4*"`, `"*"`).
+    pub model_pattern: String,
+    /// Backend name to match, or empty string to match all backends.
+    #[serde(default)]
+    pub backend_name: String,
+    /// Processor IDs to run before sending the request upstream.
+    #[serde(default)]
+    pub preprocessors: Vec<String>,
+    /// Processor IDs to run on the response before returning to the client.
+    #[serde(default)]
+    pub postprocessors: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -156,6 +174,60 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Resolve all processor IDs that apply for a given model + backend pair.
+    pub fn resolve_processors(
+        rules: &[ProcessorRule],
+        model: &str,
+        backend_name: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut pre = Vec::new();
+        let mut post = Vec::new();
+        for rule in rules {
+            let backend_matches =
+                rule.backend_name.is_empty() || rule.backend_name == backend_name;
+            if backend_matches && glob_match(&rule.model_pattern, model) {
+                for id in &rule.preprocessors {
+                    if !pre.contains(id) {
+                        pre.push(id.clone());
+                    }
+                }
+                for id in &rule.postprocessors {
+                    if !post.contains(id) {
+                        post.push(id.clone());
+                    }
+                }
+            }
+        }
+        (pre, post)
+    }
+}
+
+/// Simple glob matching: supports `*` as wildcard for any sequence of characters.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat = pattern.to_lowercase();
+    let txt = text.to_lowercase();
+    let pat_chars: Vec<char> = pat.chars().collect();
+    let txt_chars: Vec<char> = txt.chars().collect();
+    let mut dp = vec![vec![false; txt_chars.len() + 1]; pat_chars.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=pat_chars.len() {
+        if pat_chars[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=pat_chars.len() {
+        for j in 1..=txt_chars.len() {
+            if pat_chars[i - 1] == '*' {
+                dp[i][j] = dp[i - 1][j] || dp[i][j - 1];
+            } else if pat_chars[i - 1] == '?' || pat_chars[i - 1] == txt_chars[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1];
+            }
+        }
+    }
+    dp[pat_chars.len()][txt_chars.len()]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -182,6 +254,7 @@ impl Default for Config {
                 privacy_mode: false,
                 model_refresh_interval_secs: default_model_refresh_interval_secs(),
             },
+            processor_rules: Vec::new(),
         }
     }
 }
@@ -233,6 +306,34 @@ listen_port = 8080
         assert_eq!(map.get("sk-myapp-abc123").unwrap(), "my-frontend-app");
         assert_eq!(map.get("sk-backend-def456").unwrap(), "backend-service");
         assert_eq!(config.backends[0].backend_type, BackendType::Ollama);
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(super::glob_match("gemma4*", "gemma4:31b"));
+        assert!(super::glob_match("gemma4*", "Gemma4-31B-IT"));
+        assert!(super::glob_match("*gemma*", "nvidia/Gemma-4-31B-IT-NVFP4"));
+        assert!(super::glob_match("*", "anything"));
+        assert!(!super::glob_match("gemma4*", "llama3:8b"));
+    }
+
+    #[test]
+    fn test_resolve_processors() {
+        let rules = vec![
+            ProcessorRule {
+                model_pattern: "*gemma*".to_string(),
+                backend_name: "".to_string(),
+                preprocessors: vec!["gemma4-tool-call-fix".to_string()],
+                postprocessors: vec!["gemma4-tool-call-fix".to_string()],
+            },
+        ];
+        let (pre, post) = Config::resolve_processors(&rules, "nvidia/Gemma-4-31B-IT", "local");
+        assert_eq!(pre, vec!["gemma4-tool-call-fix"]);
+        assert_eq!(post, vec!["gemma4-tool-call-fix"]);
+
+        let (pre, post) = Config::resolve_processors(&rules, "llama3:8b", "local");
+        assert!(pre.is_empty());
+        assert!(post.is_empty());
     }
 
     #[test]

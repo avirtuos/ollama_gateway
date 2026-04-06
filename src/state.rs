@@ -6,9 +6,10 @@ use axum::body::Body;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::config::{BackendConfig, LangfuseConfig, ServerConfig};
+use crate::config::{BackendConfig, LangfuseConfig, ProcessorRule, ServerConfig};
 use crate::langfuse::LangfuseCollector;
 use crate::metrics::MetricsCollector;
+use crate::processors::ProcessorRegistry;
 use crate::registry::ModelRegistry;
 
 pub struct AppState {
@@ -27,4 +28,8 @@ pub struct AppState {
     pub config_write_lock: Mutex<()>,
     /// Trigger an immediate model registry refresh from the admin API.
     pub registry_refresh_notify: Arc<Notify>,
+    /// Built-in processor implementations (immutable after init).
+    pub processor_registry: Arc<ProcessorRegistry>,
+    /// User-configured rules mapping (model, backend) → processor IDs.
+    pub processor_rules: Arc<RwLock<Vec<ProcessorRule>>>,
 }

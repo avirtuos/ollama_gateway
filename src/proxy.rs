@@ -18,10 +18,11 @@ use axum::response::IntoResponse;
 
 use crate::{
     auth::{AppName, BearerToken},
-    config::{BackendConfig, BackendType},
+    config::{BackendConfig, BackendType, Config},
     connection_id::ConnectionId,
     langfuse::{LangfuseCollector, LangfuseEvent},
     metrics::{MetricsCollector, MetricsRecord},
+    processors::ProcessorRegistry,
     registry::ModelRegistry,
     state::AppState,
 };
@@ -176,6 +177,26 @@ async fn dispatch(
                 }
             };
 
+            // Resolve pre/post processors for this model + backend pair
+            let processor_rules = state.processor_rules.read().await.clone();
+            let model_str = model_name.as_deref().unwrap_or("");
+            let (pre_ids, post_ids) = Config::resolve_processors(
+                &processor_rules, model_str, &backend.name,
+            );
+
+            // Apply preprocessors to the request body
+            let req_bytes = if !pre_ids.is_empty() {
+                if let Some(ref mut json) = req_json {
+                    state.processor_registry.apply_preprocessors(&pre_ids, json);
+                    debug!(model = model_str, processors = ?pre_ids, "Applied preprocessors");
+                    serde_json::to_vec(json).map(bytes::Bytes::from).unwrap_or(req_bytes)
+                } else {
+                    req_bytes
+                }
+            } else {
+                req_bytes
+            };
+
             let collector = state.langfuse_collector.read().await.clone();
             let on_traced_path = TRACED_PATHS.iter().any(|p| path == *p || path.starts_with(p));
             let log_content = !privacy_mode && on_traced_path;
@@ -186,9 +207,10 @@ async fn dispatch(
                     state, collector, rebuilt, req_json,
                     &backend, log_content, app_name.to_string(),
                     Some(session_id.to_string()),
+                    post_ids,
                 ).await
             } else {
-                proxy_single_with_metrics(state, rebuilt, &backend, path).await
+                proxy_single_with_metrics(state, rebuilt, &backend, path, post_ids).await
             }
         }
 
@@ -200,7 +222,7 @@ async fn dispatch(
                     return Err(StatusCode::BAD_GATEWAY);
                 }
             };
-            proxy_single_with_metrics(state, req, &backend, path).await
+            proxy_single_with_metrics(state, req, &backend, path, vec![]).await
         }
     }
 }
@@ -211,6 +233,7 @@ async fn proxy_single_with_metrics(
     req: Request<Body>,
     backend: &BackendConfig,
     path: &str,
+    post_ids: Vec<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let start_time = Utc::now();
     let upstream_req = build_upstream_request(&backend.url, req).map_err(|e| {
@@ -240,7 +263,29 @@ async fn proxy_single_with_metrics(
         status_code,
     });
 
-    Ok(convert_response(resp))
+    if !post_ids.is_empty() {
+        apply_postprocessors_to_response(resp, &state.processor_registry, &post_ids).await
+    } else {
+        Ok(convert_response(resp))
+    }
+}
+
+/// Buffer a response, apply postprocessors, and return the modified response.
+async fn apply_postprocessors_to_response(
+    resp: hyper::Response<hyper::body::Incoming>,
+    registry: &Arc<ProcessorRegistry>,
+    post_ids: &[String],
+) -> Result<Response<Body>, StatusCode> {
+    let (parts, body) = resp.into_parts();
+    let resp_bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+
+    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+        registry.apply_postprocessors(post_ids, &mut json);
+        let new_bytes = serde_json::to_vec(&json).unwrap_or_else(|_| resp_bytes.to_vec());
+        Ok(Response::from_parts(parts, Body::from(new_bytes)))
+    } else {
+        Ok(Response::from_parts(parts, Body::from(resp_bytes)))
+    }
 }
 
 /// Fan out to all healthy backends, aggregate their model lists.
@@ -369,6 +414,7 @@ async fn proxy_with_tracing_buffered(
     log_content: bool,
     app_name: String,
     session_id: Option<String>,
+    post_ids: Vec<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let path = req.uri().path().to_string();
     let start_time = Utc::now();
@@ -391,10 +437,11 @@ async fn proxy_with_tracing_buffered(
     })?;
 
     let metrics = state.metrics_collector.clone();
+    let proc_registry = state.processor_registry.clone();
     if streaming {
-        handle_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
+        handle_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name), proc_registry, post_ids).await
     } else {
-        handle_non_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name)).await
+        handle_non_streaming_response(collector, metrics, resp, req_json, app_name, path, start_time, session_id, log_content, Some(backend_name), proc_registry, post_ids).await
     }
 }
 
@@ -409,6 +456,8 @@ async fn handle_non_streaming_response(
     session_id: Option<String>,
     log_content: bool,
     backend_name: Option<String>,
+    proc_registry: Arc<ProcessorRegistry>,
+    post_ids: Vec<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
     let status_code = resp_parts.status.as_u16();
@@ -417,6 +466,18 @@ async fn handle_non_streaming_response(
         .await
         .map(|c| c.to_bytes())
         .unwrap_or_default();
+
+    // Apply postprocessors to the buffered response
+    let resp_bytes = if !post_ids.is_empty() {
+        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            proc_registry.apply_postprocessors(&post_ids, &mut json);
+            serde_json::to_vec(&json).map(bytes::Bytes::from).unwrap_or(resp_bytes)
+        } else {
+            resp_bytes
+        }
+    } else {
+        resp_bytes
+    };
 
     let end_time = Utc::now();
 
@@ -490,11 +551,15 @@ async fn handle_streaming_response(
     session_id: Option<String>,
     log_content: bool,
     backend_name: Option<String>,
+    proc_registry: Arc<ProcessorRegistry>,
+    post_ids: Vec<String>,
 ) -> Result<Response<Body>, StatusCode> {
     let (resp_parts, resp_body) = resp.into_parts();
     let status_code = resp_parts.status.as_u16();
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let has_postprocessors = !post_ids.is_empty();
+    let is_sse = path.starts_with("/v1/");
 
     tokio::spawn(async move {
         let mut accumulated = Vec::<u8>::new();
@@ -508,6 +573,14 @@ async fn handle_streaming_response(
                         if first_chunk_time.is_none() {
                             first_chunk_time = Some(Utc::now());
                         }
+
+                        // Apply postprocessors to each streaming chunk
+                        let data = if has_postprocessors {
+                            process_streaming_chunk(&data, &proc_registry, &post_ids, is_sse)
+                        } else {
+                            data
+                        };
+
                         accumulated.extend_from_slice(&data);
                         if tx.send(Ok(data)).await.is_err() {
                             break;
@@ -888,6 +961,57 @@ fn openai_usage(resp_json: &serde_json::Value) -> (Option<u64>, Option<u64>) {
     let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
     let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
     (prompt_tokens, completion_tokens)
+}
+
+/// Apply postprocessors to a raw streaming data chunk.
+/// Each chunk may contain one or more JSON lines (NDJSON) or SSE `data:` lines.
+fn process_streaming_chunk(
+    data: &Bytes,
+    registry: &Arc<ProcessorRegistry>,
+    post_ids: &[String],
+    is_sse: bool,
+) -> Bytes {
+    let text = match std::str::from_utf8(data) {
+        Ok(t) => t,
+        Err(_) => return data.clone(),
+    };
+
+    let mut output = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if is_sse {
+            if let Some(payload) = line.trim_end().strip_prefix("data: ") {
+                if payload == "[DONE]" {
+                    output.push_str(line);
+                    continue;
+                }
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(payload) {
+                    registry.apply_chunk_postprocessors(post_ids, &mut json);
+                    output.push_str("data: ");
+                    output.push_str(&serde_json::to_string(&json).unwrap_or_else(|_| payload.to_string()));
+                    output.push('\n');
+                    continue;
+                }
+            }
+            output.push_str(line);
+        } else {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                output.push_str(line);
+                continue;
+            }
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                registry.apply_chunk_postprocessors(post_ids, &mut json);
+                output.push_str(&serde_json::to_string(&json).unwrap_or_else(|_| trimmed.to_string()));
+                if line.ends_with('\n') {
+                    output.push('\n');
+                }
+            } else {
+                output.push_str(line);
+            }
+        }
+    }
+
+    Bytes::from(output)
 }
 
 pub fn build_upstream_request(

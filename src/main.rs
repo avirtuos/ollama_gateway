@@ -6,6 +6,7 @@ mod error;
 mod langfuse;
 mod metrics;
 mod ollama;
+mod processors;
 mod proxy;
 mod registry;
 mod state;
@@ -24,6 +25,7 @@ use config::Config;
 use connection_id::ConnectionIdLayer;
 use langfuse::LangfuseCollector;
 use metrics::MetricsCollector;
+use processors::ProcessorRegistry;
 use proxy::proxy_handler;
 use registry::ModelRegistry;
 use state::AppState;
@@ -99,6 +101,12 @@ async fn main() -> anyhow::Result<()> {
 
     let registry_refresh_notify = Arc::new(Notify::new());
 
+    let processor_registry = Arc::new(ProcessorRegistry::new());
+    info!(
+        count = processor_registry.list().len(),
+        "Built-in processors loaded"
+    );
+
     let state = Arc::new(AppState {
         config_path: cli.config.clone(),
         admin_password,
@@ -113,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         server_config: config.server.clone(),
         config_write_lock: Mutex::new(()),
         registry_refresh_notify: registry_refresh_notify.clone(),
+        processor_registry,
+        processor_rules: Arc::new(RwLock::new(config.processor_rules.clone())),
     });
 
     // Background registry refresh task

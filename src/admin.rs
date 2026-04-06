@@ -16,7 +16,7 @@ use serde_json::json;
 use tracing::{error, info};
 
 use crate::auth::AppName;
-use crate::config::{BackendConfig, BackendType, Config, LangfuseConfig, TokenEntry};
+use crate::config::{BackendConfig, BackendType, Config, LangfuseConfig, ProcessorRule, TokenEntry};
 use crate::langfuse::LangfuseCollector;
 use crate::proxy::proxy_handler;
 use crate::state::AppState;
@@ -38,6 +38,9 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/api/metrics/backends", get(get_metrics_backends))
         .route("/api/metrics/summary", get(get_metrics_summary))
         .route("/api/metrics/timeseries", get(get_metrics_timeseries))
+        .route("/api/processors", get(get_processors))
+        .route("/api/processor-rules", get(get_processor_rules).post(add_processor_rule))
+        .route("/api/processor-rules/{index}", put(update_processor_rule).delete(delete_processor_rule))
         .route("/api/chat", post(admin_chat))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -492,6 +495,104 @@ async fn get_metrics_timeseries(
     Json(serde_json::json!(data))
 }
 
+// --- Processors ---
+
+async fn get_processors(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let available = state.processor_registry.list();
+    Json(serde_json::to_value(&available).unwrap_or_default())
+}
+
+async fn get_processor_rules(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let rules = state.processor_rules.read().await;
+    Json(serde_json::to_value(&*rules).unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct ProcessorRuleRequest {
+    model_pattern: String,
+    #[serde(default)]
+    backend_name: String,
+    #[serde(default)]
+    preprocessors: Vec<String>,
+    #[serde(default)]
+    postprocessors: Vec<String>,
+}
+
+async fn add_processor_rule(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ProcessorRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if body.model_pattern.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model_pattern is required" })),
+        ));
+    }
+
+    {
+        let mut rules = state.processor_rules.write().await;
+        rules.push(ProcessorRule {
+            model_pattern: body.model_pattern,
+            backend_name: body.backend_name,
+            preprocessors: body.preprocessors,
+            postprocessors: body.postprocessors,
+        });
+    }
+
+    if let Err(e) = save_config_to_disk(&state).await {
+        error!(error = %e, "Failed to save config to disk");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to persist configuration" }))));
+    }
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn update_processor_rule(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+    Json(body): Json<ProcessorRuleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    {
+        let mut rules = state.processor_rules.write().await;
+        if index >= rules.len() {
+            return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "Rule index out of range" }))));
+        }
+        rules[index] = ProcessorRule {
+            model_pattern: body.model_pattern,
+            backend_name: body.backend_name,
+            preprocessors: body.preprocessors,
+            postprocessors: body.postprocessors,
+        };
+    }
+
+    if let Err(e) = save_config_to_disk(&state).await {
+        error!(error = %e, "Failed to save config to disk");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to persist configuration" }))));
+    }
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
+async fn delete_processor_rule(
+    State(state): State<Arc<AppState>>,
+    Path(index): Path<usize>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    {
+        let mut rules = state.processor_rules.write().await;
+        if index >= rules.len() {
+            return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "Rule index out of range" }))));
+        }
+        rules.remove(index);
+    }
+
+    if let Err(e) = save_config_to_disk(&state).await {
+        error!(error = %e, "Failed to save config to disk");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to persist configuration" }))));
+    }
+
+    Ok(Json(json!({ "status": "ok" })))
+}
+
 async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
     let langfuse = state.langfuse_config.read().await.clone();
     let tokens: Vec<TokenEntry> = {
@@ -507,6 +608,7 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
 
     let backends = state.backends.read().await.clone();
     let privacy_mode = *state.privacy_mode.read().await;
+    let processor_rules = state.processor_rules.read().await.clone();
     let config = Config {
         ollama: None,
         backends,
@@ -516,6 +618,7 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
             privacy_mode,
             ..state.server_config.clone()
         },
+        processor_rules,
     };
 
     let _write_guard = state.config_write_lock.lock().await;
