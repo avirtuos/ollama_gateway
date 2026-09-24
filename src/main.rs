@@ -1,4 +1,5 @@
 mod admin;
+mod admin_auth;
 mod auth;
 mod config;
 mod connection_id;
@@ -50,10 +51,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load_or_create(&cli.config)?;
 
-    let admin_password = std::env::var("ADMIN_PASSWORD").unwrap_or_else(|_| {
-        tracing::warn!("ADMIN_PASSWORD env var not set; admin UI will require empty password");
-        String::new()
-    });
+    if config.admin.password_hash.is_empty() {
+        tracing::warn!("No admin password configured; admin UI is unauthenticated. Set one from the Settings tab.");
+    }
 
     // Env vars override config file ports (config file values are preserved for saving)
     let proxy_port: u16 = std::env::var("PROXY_PORT")
@@ -109,7 +109,8 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         config_path: cli.config.clone(),
-        admin_password,
+        admin_password_hash: Arc::new(RwLock::new(config.admin.password_hash.clone())),
+        admin_sessions: admin_auth::SessionStore::new(),
         token_map: Arc::new(RwLock::new(config.token_map())),
         langfuse_config: Arc::new(RwLock::new(config.langfuse.clone())),
         langfuse_collector: Arc::new(RwLock::new(langfuse_collector.clone())),
@@ -141,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
-    // Admin app — HTTP Basic auth, separate port
+    // Admin app — cookie session auth, separate port
     let admin_app = admin_router(state.clone());
 
     let proxy_addr: SocketAddr = format!("{}:{}", config.server.listen_addr, proxy_port).parse()?;

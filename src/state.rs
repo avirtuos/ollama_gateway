@@ -6,6 +6,7 @@ use axum::body::Body;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
 use tokio::sync::{Mutex, Notify, RwLock};
 
+use crate::admin_auth::SessionStore;
 use crate::config::{BackendConfig, LangfuseConfig, ProcessorRule, ServerConfig};
 use crate::langfuse::LangfuseCollector;
 use crate::metrics::MetricsCollector;
@@ -14,7 +15,10 @@ use crate::registry::ModelRegistry;
 
 pub struct AppState {
     pub config_path: PathBuf,
-    pub admin_password: String,
+    /// Argon2id PHC string of the admin password. Empty = admin UI requires no login.
+    pub admin_password_hash: Arc<RwLock<String>>,
+    /// Valid admin session tokens (in-memory only).
+    pub admin_sessions: SessionStore,
     pub token_map: Arc<RwLock<HashMap<String, String>>>,
     pub langfuse_config: Arc<RwLock<LangfuseConfig>>,
     pub langfuse_collector: Arc<RwLock<Option<Arc<LangfuseCollector>>>>,

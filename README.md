@@ -33,10 +33,10 @@ The admin UI includes a Metrics page that provides real-time visibility into API
 cp config.example.toml config.toml
 # Edit config.toml as needed
 
-ADMIN_PASSWORD=secret cargo run -- --config config.toml
+cargo run -- --config config.toml
 ```
 
-Navigate to `http://localhost:8080/admin/` and enter your admin password.
+Navigate to `http://localhost:8081/` — the admin UI is open by default. Set a password for it from the **Settings** tab whenever you're ready to restrict access.
 
 ## Configuration
 
@@ -66,10 +66,11 @@ listen_port = 8080
 
 | Variable         | Default | Description                                                                 |
 |------------------|---------|-----------------------------------------------------------------------------|
-| `ADMIN_PASSWORD` | *(none)*| Password for the `/admin/` web UI (Basic Auth). Strongly recommended.       |
 | `PROXY_PORT`     | `8080`  | Port the Ollama proxy listens on. Overrides `server.listen_port` in config. |
 | `ADMIN_PORT`     | `8081`  | Port the admin UI listens on. Overrides `server.admin_port` in config.      |
 | `RUST_LOG`       | `info`  | Log level filter. Use `debug` for request/Langfuse flush details.           |
+
+The admin UI password is no longer set via an environment variable — it's managed from the admin UI's Settings tab and stored (as an Argon2id hash) in `config.toml`. Leaving it unset means the admin UI requires no login.
 
 ## Docker
 
@@ -77,12 +78,13 @@ listen_port = 8080
 docker run -d \
   -p 8080:8080 \
   -p 8081:8081 \
-  -e ADMIN_PASSWORD=secret \
   -e PROXY_PORT=8080 \
   -e ADMIN_PORT=8081 \
   -v /path/to/config.toml:/etc/ollama_gateway/config.toml \
   avirtuos/ollama_gateway:latest
 ```
+
+Set an admin password from the Settings tab after first start — see [Admin UI](#admin-ui) below.
 
 ## Portainer Stack
 
@@ -99,7 +101,6 @@ services:
       - "${PROXY_PORT:-8080}:8080"
       - "${ADMIN_PORT:-8081}:8081"
     environment:
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
       - PROXY_PORT=${PROXY_PORT:-8080}
       - ADMIN_PORT=${ADMIN_PORT:-8081}
       - RUST_LOG=${RUST_LOG:-info}
@@ -114,7 +115,6 @@ volumes:
 
 | Variable         | Example          | Description                                     |
 |------------------|------------------|-------------------------------------------------|
-| `ADMIN_PASSWORD` | `changeme`       | Admin UI password — required                    |
 | `PROXY_PORT`     | `8080`           | Host port for the Ollama proxy                  |
 | `ADMIN_PORT`     | `8081`           | Host port for the admin UI                      |
 | `RUST_LOG`       | `info`           | Log verbosity (`error`, `warn`, `info`, `debug`) |
@@ -123,12 +123,13 @@ volumes:
 
 ## Admin UI
 
-Browse to `/admin/` (e.g. `http://localhost:8080/admin/`). The browser will prompt for credentials — use username `admin` and the value of `ADMIN_PASSWORD`.
+Browse to `http://<host>:${ADMIN_PORT}/`. By default the admin UI requires no login; from the **Settings** tab, check "Require a password to access this admin UI" and set one to restrict access. Once a password is set, visiting the UI shows a login screen — sessions are tracked with a cookie, so you won't be prompted again on refresh, and only clear on logout or gateway restart.
 
 From the UI you can:
 - Set the upstream URL and **backend type** (Ollama or llama.cpp)
 - Enable/disable Langfuse and update all Langfuse settings
 - Add or remove Bearer tokens at runtime
+- Set or remove the admin UI password
 - Chat directly with the upstream model to verify connectivity
 
 All changes are persisted immediately to the TOML config file.
