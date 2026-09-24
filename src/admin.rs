@@ -10,13 +10,13 @@ use axum::{
     Json, Router,
 };
 use http_body_util::BodyExt;
-use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
 
+use crate::admin_auth::{self, SESSION_COOKIE_NAME};
 use crate::auth::AppName;
-use crate::config::{BackendConfig, BackendType, Config, LangfuseConfig, ProcessorRule, TokenEntry};
+use crate::config::{AdminConfig, BackendConfig, BackendType, Config, LangfuseConfig, ProcessorRule, TokenEntry};
 use crate::langfuse::LangfuseCollector;
 use crate::proxy::proxy_handler;
 use crate::state::AppState;
@@ -24,12 +24,12 @@ use crate::state::AppState;
 static ADMIN_HTML: &str = include_str!("../assets/admin.html");
 
 pub fn admin_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        .route("/", get(admin_ui))
+    let protected = Router::new()
         .route("/api/langfuse", get(get_langfuse).put(put_langfuse))
         .route("/api/tokens", get(get_tokens).post(add_token))
         .route("/api/tokens/{token}", delete(delete_token))
         .route("/api/config", get(get_config).put(put_config))
+        .route("/api/admin-password", put(put_admin_password))
         .route("/api/backends", get(get_backends).post(add_backend))
         .route("/api/backends/refresh", post(refresh_backends))
         .route("/api/backends/{name}", put(update_backend).delete(delete_backend))
@@ -44,50 +44,177 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/api/chat", post(admin_chat))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            basic_auth_middleware,
-        ))
+            session_auth_middleware,
+        ));
+
+    Router::new()
+        .route("/", get(admin_ui))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
+        .merge(protected)
         .with_state(state)
 }
 
-pub async fn basic_auth_middleware(
+/// Pull the admin session token out of the request's `Cookie` header, if any.
+fn session_token(req: &Request<Body>) -> Option<String> {
+    req.headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(admin_auth::session_token_from_cookie_header)
+}
+
+fn session_cookie_header(token: &str) -> String {
+    format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
+    )
+}
+
+fn expired_session_cookie_header() -> String {
+    format!("{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+}
+
+/// Guards every `/api/*` route except `/api/auth/status` and `/api/login`.
+/// When no admin password is configured, the admin UI is open and every
+/// request passes through unauthenticated.
+pub async fn session_auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let auth_header = req
-        .headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok());
+    let password_required = !state.admin_password_hash.read().await.is_empty();
+    if !password_required {
+        return next.run(req).await;
+    }
 
-    let is_authorized = match auth_header {
-        Some(h) if h.starts_with("Basic ") => {
-            let encoded = &h["Basic ".len()..];
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .map(|credentials| {
-                    let expected = format!("admin:{}", state.admin_password);
-                    credentials == expected
-                })
-                .unwrap_or(false)
-        }
-        _ => false,
+    let authorized = match session_token(&req) {
+        Some(token) => state.admin_sessions.is_valid(&token).await,
+        None => false,
     };
 
-    if is_authorized {
+    if authorized {
         next.run(req).await
     } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            [(
-                header::WWW_AUTHENTICATE,
-                "Basic realm=\"Ollama Gateway Admin\"",
-            )],
-            Json(json!({ "error": "Unauthorized" })),
-        )
-            .into_response()
+        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Unauthorized" }))).into_response()
     }
+}
+
+async fn auth_status(State(state): State<Arc<AppState>>, req: Request<Body>) -> Json<serde_json::Value> {
+    let auth_required = !state.admin_password_hash.read().await.is_empty();
+    let authenticated = if auth_required {
+        match session_token(&req) {
+            Some(token) => state.admin_sessions.is_valid(&token).await,
+            None => false,
+        }
+    } else {
+        true
+    };
+    Json(json!({ "auth_required": auth_required, "authenticated": authenticated }))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+async fn login(State(state): State<Arc<AppState>>, Json(body): Json<LoginRequest>) -> Response {
+    let hash = state.admin_password_hash.read().await.clone();
+    if !hash.is_empty() {
+        let password = body.password.clone();
+        let valid = tokio::task::spawn_blocking(move || admin_auth::verify_password(&hash, &password))
+            .await
+            .unwrap_or(false);
+        if !valid {
+            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Incorrect password" }))).into_response();
+        }
+    }
+
+    let token = state.admin_sessions.create().await;
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, session_cookie_header(&token))],
+        Json(json!({ "status": "ok" })),
+    )
+        .into_response()
+}
+
+async fn logout(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    if let Some(token) = session_token(&req) {
+        state.admin_sessions.invalidate(&token).await;
+    }
+    (
+        StatusCode::OK,
+        [(header::SET_COOKIE, expired_session_cookie_header())],
+        Json(json!({ "status": "ok" })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct AdminPasswordUpdate {
+    /// New plaintext password, or empty/absent to remove password protection.
+    #[serde(default)]
+    new_password: String,
+}
+
+async fn put_admin_password(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AdminPasswordUpdate>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    let new_password = body.new_password.trim().to_string();
+    let new_hash = if new_password.is_empty() {
+        String::new()
+    } else {
+        tokio::task::spawn_blocking(move || admin_auth::hash_password(&new_password))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to hash password: {e}") })),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to hash password: {e}") })),
+                )
+            })?
+    };
+
+    {
+        let mut guard = state.admin_password_hash.write().await;
+        *guard = new_hash.clone();
+    }
+    // Every previously issued session was minted under the old password policy;
+    // drop them all so the change takes effect everywhere immediately.
+    state.admin_sessions.invalidate_all().await;
+
+    if let Err(e) = save_config_to_disk(&state).await {
+        error!(error = %e, "Failed to save config to disk");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Failed to persist configuration" })),
+        ));
+    }
+
+    if new_hash.is_empty() {
+        // Password protection just got disabled — nothing left to authenticate.
+        return Ok((
+            StatusCode::OK,
+            [(header::SET_COOKIE, expired_session_cookie_header())],
+            Json(json!({ "status": "ok" })),
+        )
+            .into_response());
+    }
+
+    // Re-issue a session for the caller so they aren't logged out by their own change.
+    let token = state.admin_sessions.create().await;
+    Ok((
+        StatusCode::OK,
+        [(header::SET_COOKIE, session_cookie_header(&token))],
+        Json(json!({ "status": "ok" })),
+    )
+        .into_response())
 }
 
 async fn admin_ui() -> Response {
@@ -609,6 +736,7 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
     let backends = state.backends.read().await.clone();
     let privacy_mode = *state.privacy_mode.read().await;
     let processor_rules = state.processor_rules.read().await.clone();
+    let admin_password_hash = state.admin_password_hash.read().await.clone();
     let config = Config {
         ollama: None,
         backends,
@@ -617,6 +745,9 @@ async fn save_config_to_disk(state: &Arc<AppState>) -> anyhow::Result<()> {
         server: crate::config::ServerConfig {
             privacy_mode,
             ..state.server_config.clone()
+        },
+        admin: AdminConfig {
+            password_hash: admin_password_hash,
         },
         processor_rules,
     };

@@ -113,6 +113,7 @@
     <button class="tab" data-tab="chat" onclick="showTab('chat')">Chat</button>
     <button class="tab" data-tab="metrics" onclick="showTab('metrics')">Metrics</button>
   </nav>
+  <button class="btn btn-secondary" id="logout-btn" onclick="doLogout()" style="display:none">Log Out</button>
 </header>
 
 <main>
@@ -130,6 +131,28 @@
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" onclick="saveConfig()">Save</button>
+      </div>
+    </section>
+    <section>
+      <h2>Admin UI Password</h2>
+      <div class="form-grid">
+        <div class="form-group full">
+          <div class="checkbox-row">
+            <input type="checkbox" id="admin-pw-enabled" onchange="onAdminPwEnabledChange()">
+            <label for="admin-pw-enabled">Require a password to access this admin UI</label>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="admin-pw-new">New Password</label>
+          <input type="password" id="admin-pw-new" placeholder="Leave blank to keep current password" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+          <label for="admin-pw-confirm">Confirm New Password</label>
+          <input type="password" id="admin-pw-confirm" placeholder="" autocomplete="new-password">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="saveAdminPassword()">Save Password Settings</button>
       </div>
     </section>
     <section>
@@ -370,25 +393,29 @@
   </div>
 </div>
 
+<!-- Login Screen -->
+<div class="modal-backdrop" id="login-screen" style="z-index:200">
+  <div class="modal">
+    <h3>Admin Login</h3>
+    <div class="form-grid">
+      <div class="form-group full">
+        <label for="login-password">Password</label>
+        <input type="password" id="login-password" placeholder="Enter admin password" autocomplete="current-password"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();doLogin();}">
+      </div>
+    </div>
+    <div id="login-error" style="color:#dc2626;font-size:.85rem;margin-top:.6rem;display:none;"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="doLogin()">Log In</button>
+    </div>
+  </div>
+</div>
+
 <div id="status-bar"></div>
 
 <script>
-  let password = null;
   let editingBackendName = null; // null = adding, string = editing
   let metricsInterval = null;
-
-  function getPasswordCookie() {
-    const match = document.cookie.split('; ').find(c => c.startsWith('admin_password='));
-    return match ? decodeURIComponent(match.split('=')[1]) : null;
-  }
-
-  function setPasswordCookie(pw) {
-    document.cookie = 'admin_password=' + encodeURIComponent(pw) + '; max-age=14400; SameSite=Strict; path=/admin';
-  }
-
-  function authHeader() {
-    return 'Basic ' + btoa('admin:' + (password || ''));
-  }
 
   function showStatus(msg, ok = true) {
     const bar = document.getElementById('status-bar');
@@ -399,18 +426,119 @@
   }
 
   async function apiFetch(url, opts = {}) {
-    if (!password && password !== '') {
-      password = prompt('Enter admin password:') ?? '';
-    }
-    opts.headers = Object.assign({ 'Authorization': authHeader(), 'Content-Type': 'application/json' }, opts.headers || {});
-    let resp = await fetch(url, opts);
+    opts.credentials = 'same-origin';
+    opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    const resp = await fetch(url, opts);
     if (resp.status === 401) {
-      password = prompt('Incorrect password. Enter admin password:') ?? '';
-      opts.headers['Authorization'] = authHeader();
-      resp = await fetch(url, opts);
+      showLoginScreen();
     }
-    if (resp.ok) setPasswordCookie(password);
     return resp;
+  }
+
+  // --- Auth ---
+
+  function showLoginScreen() {
+    document.getElementById('login-screen').classList.add('open');
+  }
+
+  function hideLoginScreen() {
+    document.getElementById('login-screen').classList.remove('open');
+  }
+
+  async function checkAuthAndInit() {
+    let authRequired = false, authenticated = true;
+    try {
+      const resp = await fetch('/api/auth/status', { credentials: 'same-origin' });
+      if (resp.ok) {
+        const d = await resp.json();
+        authRequired = !!d.auth_required;
+        authenticated = !!d.authenticated;
+      }
+    } catch (e) { /* treat as unauthenticated below */ }
+
+    document.getElementById('logout-btn').style.display = authRequired ? '' : 'none';
+
+    if (authRequired && !authenticated) {
+      showLoginScreen();
+    } else {
+      hideLoginScreen();
+      await initApp();
+    }
+  }
+
+  async function doLogin() {
+    const pwInput = document.getElementById('login-password');
+    const errBox = document.getElementById('login-error');
+    const resp = await fetch('/api/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pwInput.value }),
+    });
+    if (resp.ok) {
+      pwInput.value = '';
+      errBox.style.display = 'none';
+      hideLoginScreen();
+      document.getElementById('logout-btn').style.display = '';
+      await initApp();
+    } else {
+      errBox.textContent = 'Incorrect password';
+      errBox.style.display = 'block';
+    }
+  }
+
+  async function doLogout() {
+    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    await checkAuthAndInit();
+  }
+
+  function onAdminPwEnabledChange() {
+    if (!document.getElementById('admin-pw-enabled').checked) {
+      if (!confirm('Disable password protection for the admin UI? Anyone with network access to this port will be able to view and change settings.')) {
+        document.getElementById('admin-pw-enabled').checked = true;
+      }
+    }
+  }
+
+  async function loadAdminPasswordSettings() {
+    const resp = await fetch('/api/auth/status', { credentials: 'same-origin' });
+    if (!resp.ok) return;
+    const d = await resp.json();
+    document.getElementById('admin-pw-enabled').checked = !!d.auth_required;
+    document.getElementById('admin-pw-new').value = '';
+    document.getElementById('admin-pw-confirm').value = '';
+  }
+
+  async function saveAdminPassword() {
+    const enabled = document.getElementById('admin-pw-enabled').checked;
+    const pw = document.getElementById('admin-pw-new').value;
+    const confirmPw = document.getElementById('admin-pw-confirm').value;
+
+    if (!enabled) {
+      const resp = await apiFetch('/api/admin-password', { method: 'PUT', body: JSON.stringify({ new_password: '' }) });
+      if (resp.ok) { showStatus('Password protection disabled'); await checkAuthAndInit(); }
+      else         { showStatus('Failed to update password settings', false); }
+      return;
+    }
+
+    if (!pw && !confirmPw) {
+      showStatus('Enter a new password to change it, or uncheck the box to remove protection', false);
+      return;
+    }
+    if (pw !== confirmPw) {
+      showStatus('Passwords do not match', false);
+      return;
+    }
+
+    const resp = await apiFetch('/api/admin-password', { method: 'PUT', body: JSON.stringify({ new_password: pw }) });
+    if (resp.ok) {
+      showStatus('Password updated');
+      document.getElementById('admin-pw-new').value = '';
+      document.getElementById('admin-pw-confirm').value = '';
+      document.getElementById('logout-btn').style.display = '';
+    } else {
+      showStatus('Failed to update password', false);
+    }
   }
 
   function showTab(name) {
@@ -946,11 +1074,12 @@
     if (e.target === this) closeBackendModal();
   });
 
+  async function initApp() {
+    await Promise.all([loadConfig(), loadLangfuse(), loadTokens(), loadAdminPasswordSettings()]);
+  }
+
   // Initial load
-  (async () => {
-    password = getPasswordCookie() ?? prompt('Enter admin password:') ?? '';
-    await Promise.all([loadConfig(), loadLangfuse(), loadTokens()]);
-  })();
+  checkAuthAndInit();
 </script>
 </body>
 </html>

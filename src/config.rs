@@ -15,7 +15,17 @@ pub struct Config {
     pub tokens: Vec<TokenEntry>,
     pub server: ServerConfig,
     #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
     pub processor_rules: Vec<ProcessorRule>,
+}
+
+/// Admin UI authentication. An empty `password_hash` means authentication is disabled.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AdminConfig {
+    /// Argon2id PHC string of the admin password. Empty = admin UI is unauthenticated.
+    #[serde(default)]
+    pub password_hash: String,
 }
 
 /// A rule that assigns pre/post processors to a (model_pattern, backend) pair.
@@ -254,6 +264,7 @@ impl Default for Config {
                 privacy_mode: false,
                 model_refresh_interval_secs: default_model_refresh_interval_secs(),
             },
+            admin: AdminConfig::default(),
             processor_rules: Vec::new(),
         }
     }
